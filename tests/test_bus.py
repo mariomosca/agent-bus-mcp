@@ -20,7 +20,7 @@ AGENT_MAP = {
     "agents": {
         "alita": {"role": "hub", "domain": "side"},
         "kai": {"role": "tech", "domain": "side"},
-        "nico": {"role": "tech brandart", "domain": "brandart"},
+        "nico": {"role": "tech (isolated domain)", "domain": "work"},
     },
     "rules": [
         {"pattern": "/w/work-hub", "agent": "alita"},
