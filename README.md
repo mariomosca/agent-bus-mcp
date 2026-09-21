@@ -41,8 +41,8 @@ arrivano. `AB_HOME` punta a un bus diverso (i test lo usano).
 
 **Identità sbagliata?** Un server MCP eredita la cwd del client, che con alcuni launcher è
 la cartella del server invece del workspace della sessione: in quel caso ogni chiamata
-risulterebbe fatta dall'''agente che possiede questa cartella. Il server se ne accorge e
-rifiuta invece di indovinare. Rimedio: `AB_AGENT` e `AB_SESSION_SLUG` nell'''entry MCP.
+risulterebbe fatta dall'agente che possiede questa cartella. Il server se ne accorge e
+rifiuta invece di indovinare. Rimedio: `AB_AGENT` e `AB_SESSION_SLUG` nell'entry MCP.
 **Non** usare `${CLAUDE_PROJECT_DIR}` in `env`: se il client non lo espande, la stringa
 letterale è peggio di niente — il server la scarta apposta.
 
