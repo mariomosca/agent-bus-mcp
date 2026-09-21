@@ -1,0 +1,18 @@
+[project]
+name = "agent-bus-mcp"
+version = "0.1.0"
+description = "MCP server for the Agent Team OS bus: list, read, send and archive messages between parallel Claude Code sessions."
+requires-python = ">=3.11"
+dependencies = [
+    "fastmcp>=2.0.0",
+]
+
+[project.scripts]
+agent-bus-mcp = "agent_bus_mcp.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agent_bus_mcp"]
