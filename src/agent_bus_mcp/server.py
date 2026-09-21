@@ -40,8 +40,16 @@ def _bus() -> Bus:
 
 
 def _whoami(bus: Bus) -> tuple[str, str]:
-    """Resolve (agent, slug) for the caller from env or cwd."""
-    cwd = os.environ.get("AB_CWD") or os.getcwd()
+    """Resolve (agent, slug) for the caller from env or cwd.
+
+    Careful: an MCP server started by a client inherits *the client's* process cwd,
+    which under some launchers is the server's own directory rather than the
+    session's workspace. That misreports the caller as whichever agent owns the
+    server's folder. AB_CWD (or AB_AGENT/AB_SESSION_SLUG, which the bus hooks
+    already export per session) pins it correctly; set them in the MCP entry when
+    the identity comes out wrong.
+    """
+    cwd = _caller_cwd()
     agent = os.environ.get("AB_AGENT") or bus.detect_agent(cwd)
     if not agent:
         raise BusError(
@@ -50,6 +58,34 @@ def _whoami(bus: Bus) -> tuple[str, str]:
         )
     slug = os.environ.get("AB_SESSION_SLUG") or slug_for_path(cwd)
     return agent, slug
+
+
+# This package's own directory. A cwd equal to it means the launcher handed us the
+# server's location instead of the session's, which would silently attribute every
+# call to whichever agent owns this folder.
+_SERVER_DIR = Path(__file__).resolve().parents[2]
+
+
+def _caller_cwd() -> str:
+    """Best guess at the *session's* directory, not the server process's.
+
+    Env vars come first, but an unexpanded placeholder (a config that wrote
+    "${CLAUDE_PROJECT_DIR}" literally) is worse than no value at all: it maps to
+    nothing and lands on a wrong fallback. Reject anything that is not a real
+    absolute path, and refuse to be identified by our own install directory.
+    """
+    for var in ("AB_CWD", "CLAUDE_PROJECT_DIR"):
+        raw = os.environ.get(var, "").strip()
+        if raw.startswith("/") and "$" not in raw and Path(raw).is_dir():
+            return raw
+    cwd = os.getcwd()
+    if Path(cwd).resolve() == _SERVER_DIR:
+        raise BusError(
+            "the bus server was started in its own directory, so the caller cannot be "
+            "identified from the cwd. Set AB_AGENT (and AB_SESSION_SLUG) in the MCP "
+            "entry, or start the server from the session's workspace."
+        )
+    return cwd
 
 
 def _summarize(path: Path, data: dict, own_slug: str) -> dict:

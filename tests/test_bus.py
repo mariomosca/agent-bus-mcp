@@ -181,3 +181,36 @@ def test_stale_session_is_hidden(bus: Bus, monkeypatch):
 
     assert bus.list_sessions("kai") == []
     assert len(bus.list_sessions("kai", include_stale=True)) == 1
+
+
+# ---------- caller identity (found by using the server for real) ----------
+
+def test_unexpanded_placeholder_is_ignored(bus: Bus, monkeypatch, tmp_path):
+    """A config that wrote "${CLAUDE_PROJECT_DIR}" literally must not be trusted:
+    it maps to no agent and would silently land on a wrong fallback."""
+    from agent_bus_mcp.server import _caller_cwd
+
+    monkeypatch.setenv("AB_CWD", "${CLAUDE_PROJECT_DIR:-${PWD}}")
+    monkeypatch.chdir(tmp_path)
+    assert _caller_cwd() == str(tmp_path)
+
+
+def test_real_path_in_env_wins_over_cwd(monkeypatch, tmp_path):
+    from agent_bus_mcp.server import _caller_cwd
+
+    real = tmp_path / "workspace"
+    real.mkdir()
+    monkeypatch.setenv("AB_CWD", str(real))
+    assert _caller_cwd() == str(real)
+
+
+def test_server_own_directory_is_refused(monkeypatch):
+    """Being launched in our own folder would attribute every call to whichever
+    agent owns it — better to fail with an actionable message."""
+    from agent_bus_mcp.server import _SERVER_DIR, _caller_cwd
+
+    monkeypatch.delenv("AB_CWD", raising=False)
+    monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+    monkeypatch.chdir(_SERVER_DIR)
+    with pytest.raises(BusError, match="own directory"):
+        _caller_cwd()

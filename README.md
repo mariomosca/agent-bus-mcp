@@ -39,6 +39,13 @@ Dedotta dalla working directory via le `rules` di `AGENT_MAP.json`, quindi una s
 deve dichiarare chi è. Override con `AB_AGENT` e `AB_SESSION_SLUG` dove le regole non
 arrivano. `AB_HOME` punta a un bus diverso (i test lo usano).
 
+**Identità sbagliata?** Un server MCP eredita la cwd del client, che con alcuni launcher è
+la cartella del server invece del workspace della sessione: in quel caso ogni chiamata
+risulterebbe fatta dall'''agente che possiede questa cartella. Il server se ne accorge e
+rifiuta invece di indovinare. Rimedio: `AB_AGENT` e `AB_SESSION_SLUG` nell'''entry MCP.
+**Non** usare `${CLAUDE_PROJECT_DIR}` in `env`: se il client non lo espande, la stringa
+letterale è peggio di niente — il server la scarta apposta.
+
 Nota: `detect_agent` qui prende il **prefisso più lungo** che matcha, mentre la lib bash
 prende la prima regola in ordine di file. Identico quando le regole non si annidano, più
 sicuro quando lo fanno.
