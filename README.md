@@ -12,10 +12,10 @@ espone come API di prima classe.
 
 | Tool | A cosa serve |
 |---|---|
-| `bus_status` | chi è sul bus e **quali sessioni sono vive adesso**, con i pendenti di ciascuna |
-| `bus_inbox` | i messaggi di *questa* sessione (i suoi + i broadcast); `all_sessions` per tutti |
-| `bus_read` | un messaggio per intero, con `_location` che dice dove sta e se è archiviato |
-| `bus_send` | invia a `kai` (tutte le sessioni) o `kai/noi-calendar` (una sola) |
+| `bus_status` | chi è sul bus e **quali sessioni sono vive adesso**, su tutte e due le macchine, con i pendenti di ciascuna |
+| `bus_inbox` | i messaggi di *questa* sessione (i suoi + i broadcast); `all_sessions` per tutti. Ogni riga ha `reply_to` |
+| `bus_read` | un messaggio per intero, con `_location` che dice dove sta e se è archiviato, e `_reply_to` |
+| `bus_send` | invia a `kai` (tutte le sessioni), `kai/noi-calendar` (una sola), `kai@mini/crewmoor` (sull'altra macchina) |
 | `bus_archive` | sposta in `.done/` o `.read/` **accanto** al messaggio, non nella radice |
 | `bus_thread` | rigioca una conversazione in ordine |
 
@@ -32,6 +32,32 @@ kai/microsoft-mcp    → solo l'altra
 `bus_status` prima di inviare, quando non si sa quante sessioni esistono. Uno slug non vivo
 **viene consegnato lo stesso** con un warning: il messaggio aspetta che quella sessione
 parta, invece di sparire.
+
+## Due macchine (v2.5)
+
+Laptop (hub, dove sta Alita) e Mac mini, stessi percorsi e stessa `AGENT_MAP.json`. Solo il
+laptop apre SSH verso il mini, mai il contrario. Stessa semantica della lib bash, stessi file:
+
+```
+kai@mini             → tutte le sessioni Kai sul mini
+kai@mini/crewmoor    → una sessione sul mini
+alita                → dal mini va al laptop (l'hub vive sull'host hub)
+```
+
+- `hosts` in `AGENT_MAP.json`, nome della macchina in `~/.agent-team-os/HOST` (override
+  `AB_HOST`; senza file = l'host con `hub: true`).
+- **laptop → mini**: scrittura atomica via SSH nella inbox del mini. Mini giù: il messaggio
+  resta in `outbox/mini/` e `bus_send` torna `queued: true` con un warning, non un errore.
+- **mini → laptop**: il messaggio aspetta in `outbox/laptop/` del mini (`queued: true`).
+- **Raccolta**: `bus_inbox` e `bus_status` sul laptop spingono la coda e tirano l'outbox del
+  mini se l'ultima raccolta ha più di 30 s (copia, verifica, poi cancella sul mini). Lock e
+  timbro condivisi con la lib bash e con il launchd di raccolta.
+- **Stato**: le sessioni del mini lette via SSH dal suo `registry/`, cache 20 s; se il mini
+  è giù resta l'ultimo elenco con `reachable: false`.
+- Ogni messaggio porta `context.host` (macchina del mittente); `reply_to` lo usa.
+
+SSH: `AB_SSH_BIN` (default `ssh`), `BatchMode=yes`, `ConnectTimeout=AB_SSH_TIMEOUT` (5),
+`ControlMaster auto` con socket in `~/.ssh/cm-%r@%h:%p` per 10 minuti.
 
 ## Identità del chiamante
 
@@ -63,10 +89,14 @@ claude mcp add agent-bus -- uv run --directory ~/Projects/07-Tooling/mcp/agent-b
 uv run --with pytest --with fastmcp --with pydantic pytest tests/ -q
 ```
 
-19 test. Quelli che contano davvero:
+45 test. Quelli che contano davvero:
 `test_targeted_message_reaches_only_its_session`,
 `test_two_sessions_do_not_overwrite_each_other`,
-`test_archive_keeps_message_in_its_own_session_dir`.
+`test_archive_keeps_message_in_its_own_session_dir`, e per le due macchine
+(`tests/test_hosts.py`, con un `ssh` finto nel `PATH` che esegue in locale su un secondo
+`AB_HOME`): `test_mini_down_queues_and_does_not_fail`,
+`test_collect_pushes_the_queue_and_pulls_the_outbox`,
+`test_pull_is_idempotent_and_keeps_what_it_cannot_read`.
 
 ## Relazione con il resto
 

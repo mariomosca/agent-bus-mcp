@@ -7,21 +7,35 @@ Layout::
 
     ~/.agent-team-os/
       AGENT_MAP.json
+      HOST                               this machine's name (v2.5, optional)
       registry/<agent>.d/<slug>.json     one entry per live session
       inboxes/<agent>/msg-*.json         broadcast: every session sees these
       inboxes/<agent>/@<slug>/msg-*.json one session only
                               .read/ .done/
       threads/<thread-id>.jsonl
       outbox/<agent>.jsonl
+      outbox/<host>/<agent>/[@<slug>/]msg-*.json   not yet delivered to <host> (v2.5)
+      hosts/<host>/last-collect[.json] status.json  collection stamp, remote status cache
+
+Two machines (v2.5): the laptop (hub) and the mini share paths and AGENT_MAP.json.
+Only the laptop opens SSH, so laptop → mini is an SSH write into the mini's inbox
+(queued in outbox/mini/ when the mini is down) and mini → laptop is a file in the
+mini's outbox/laptop/ that the laptop pulls. Same semantics as the bash lib.
 """
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import random
 import re
+import shlex
+import shutil
 import string
+import subprocess
+import tarfile
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -31,6 +45,12 @@ from pathlib import Path
 SESSION_TTL_MIN = int(os.environ.get("AB_SESSION_TTL_MIN", "240"))
 
 SLUG_SAFE = re.compile(r"[^a-z0-9._-]")
+
+# v2.5 transport knobs, same names and defaults as the bash lib.
+SSH_BIN = os.environ.get("AB_SSH_BIN", "ssh")
+SSH_TIMEOUT = int(os.environ.get("AB_SSH_TIMEOUT", "5"))
+COLLECT_INTERVAL = int(os.environ.get("AB_COLLECT_INTERVAL", "30"))
+REMOTE_STATUS_TTL = int(os.environ.get("AB_REMOTE_STATUS_TTL", "20"))
 
 
 def bus_home() -> Path:
@@ -64,13 +84,31 @@ def slug_for_path(path: str | os.PathLike[str]) -> str:
     return SLUG_SAFE.sub("-", base.lower())
 
 
-def parse_addr(addr: str) -> tuple[str, str | None]:
-    """'kai/noi-calendar' -> ('kai', 'noi-calendar'); 'kai' -> ('kai', None)."""
+def parse_full_addr(addr: str) -> tuple[str, str | None, str | None]:
+    """Agent, slug, host of an address.
+
+    'kai' -> ('kai', None, None); 'kai/crewmoor' -> ('kai', 'crewmoor', None);
+    'kai@mini/crewmoor' and 'kai/crewmoor@mini' -> ('kai', 'crewmoor', 'mini').
+    Slugs never contain '@' (slug_for_path folds it), so the split is unambiguous.
+    """
     addr = addr.strip()
-    if "/" in addr:
-        agent, _, slug = addr.partition("/")
-        return agent.strip(), (slug.strip() or None)
-    return addr, None
+    head, sep, tail = addr.partition("/")
+    host = None
+    if "@" in head:
+        head, _, host = head.partition("@")
+    elif "@" in tail:
+        tail, _, host = tail.rpartition("@")
+    slug = tail.strip() if sep else ""
+    return head.strip(), (slug or None), ((host or "").strip() or None)
+
+
+def parse_addr(addr: str) -> tuple[str, str | None]:
+    """'kai/noi-calendar' -> ('kai', 'noi-calendar'); 'kai' -> ('kai', None).
+
+    The host part, if any, is dropped: see parse_full_addr.
+    """
+    agent, slug, _ = parse_full_addr(addr)
+    return agent, slug
 
 
 def _read_json(path: Path) -> dict | None:
@@ -126,6 +164,292 @@ class Bus:
                     best = (len(pattern), rule.get("agent", ""))
         return best[1] if best and best[1] else None
 
+    # ---------- hosts (v2.5) ----------
+
+    def hosts(self) -> dict:
+        return self.agent_map().get("hosts") or {}
+
+    def host_self(self) -> str | None:
+        """This machine: AB_HOST, else the HOST file, else the hub host, else None."""
+        env = os.environ.get("AB_HOST", "").strip()
+        if env:
+            return env
+        f = self.home / "HOST"
+        try:
+            name = f.read_text(encoding="utf-8").strip().splitlines()[0].strip()
+            if name:
+                return name
+        except (OSError, IndexError):
+            pass
+        return self.hub_host()
+
+    def hub_host(self) -> str | None:
+        for name, conf in self.hosts().items():
+            if (conf or {}).get("hub") is True:
+                return name
+        return None
+
+    def host_bus_home(self, host: str) -> str:
+        return (self.hosts().get(host) or {}).get("bus_home") or str(self.home)
+
+    def remote_hosts(self) -> list[str]:
+        """Hosts this machine opens SSH to (an `ssh` target, and not us)."""
+        me = self.host_self()
+        return sorted(h for h, c in self.hosts().items() if h != me and (c or {}).get("ssh"))
+
+    def resolve_host(self, agent: str, want: str | None = None) -> str | None:
+        """Host a message must travel to; None = this machine.
+
+        Explicit @host wins; then agents.<a>.host; then the hub agent on the hub
+        host; otherwise here. An explicit unknown host is refused.
+        """
+        me = self.host_self()
+        if want:
+            if want == me:
+                return None
+            if want not in self.hosts():
+                known = ", ".join(sorted(self.hosts())) or 'none ("hosts" missing in AGENT_MAP.json)'
+                raise BusError(f"unknown host '{want}'. Known: {known}")
+            return want
+        pinned = (self.agents().get(agent) or {}).get("host")
+        if not pinned:
+            hub_agent = (self.agent_map().get("cc_awareness") or {}).get("hub")
+            if hub_agent and agent == hub_agent:
+                pinned = self.hub_host()
+        if not pinned or pinned == me or pinned not in self.hosts():
+            return None
+        return pinned
+
+    def ssh(self, host: str, command: str, data: bytes | None = None) -> subprocess.CompletedProcess | None:
+        """Run a command on a host with the bus's SSH options; None if it cannot run.
+
+        BatchMode never prompts; ControlMaster keeps one connection for 10 minutes
+        so a call costs milliseconds. The remote shell may be zsh: no globs.
+        """
+        target = (self.hosts().get(host) or {}).get("ssh")
+        if not target:
+            return None
+        ssh_dir = Path.home() / ".ssh"
+        ssh_dir.mkdir(exist_ok=True)
+        argv = [
+            SSH_BIN, "-o", "BatchMode=yes", "-o", f"ConnectTimeout={SSH_TIMEOUT}",
+            "-o", "ControlMaster=auto", "-o", f"ControlPath={ssh_dir}/cm-%r@%h:%p",
+            "-o", "ControlPersist=10m", target, command,
+        ]
+        try:
+            return subprocess.run(argv, input=data if data is not None else b"",
+                                  capture_output=True, timeout=SSH_TIMEOUT + 25)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+
+    def remote_put(self, host: str, rel: str, data: bytes) -> bool:
+        """Place one message on a host atomically (tmp + mv). rel = inboxes/<agent>/[@slug/]<id>.json."""
+        bh = self.host_bus_home(host)
+        target = f"{bh}/{rel}"
+        d = os.path.dirname(target)
+        dirs = [shlex.quote(d)]
+        if os.path.basename(d).startswith("@"):
+            dirs += [shlex.quote(f"{d}/.read"), shlex.quote(f"{d}/.done")]
+        q = shlex.quote(target)
+        res = self.ssh(host, f"mkdir -p {' '.join(dirs)} && cat > {q}.tmp && mv {q}.tmp {q}", data)
+        return res is not None and res.returncode == 0
+
+    def queue_for_host(self, host: str, rel: str, data: bytes) -> Path:
+        dest = self.home / "outbox" / host / rel.removeprefix("inboxes/")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dest.with_suffix(dest.suffix + ".tmp")
+        tmp.write_bytes(data)
+        tmp.replace(dest)
+        return dest
+
+    def deliver_remote(self, host: str, agent: str, slug: str | None, record: dict) -> str:
+        """'delivered' or 'queued'. Never raises: an unreachable host gets a queue."""
+        rel = f"inboxes/{agent}" + (f"/@{slug}" if slug else "") + f"/{record['id']}.json"
+        data = (json.dumps(record, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+        if (self.hosts().get(host) or {}).get("ssh") and self.remote_put(host, rel, data):
+            return "delivered"
+        self.queue_for_host(host, rel, data)
+        return "queued"
+
+    def _host_state(self, host: str) -> Path:
+        d = self.home / "hosts" / host
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    @staticmethod
+    def _age(path: Path) -> float:
+        try:
+            return time.time() - path.stat().st_mtime
+        except OSError:
+            return float("inf")
+
+    def collect(self, force: bool = False, only: str | None = None) -> list[dict]:
+        """Exchange with every SSH-reachable host: push our queue, pull its outbox
+        for us. Throttled per host to COLLECT_INTERVAL s unless forced. Copy,
+        verify, then delete: nothing is removed remotely before it is in an inbox."""
+        out = []
+        for host in self.remote_hosts():
+            if only and host != only:
+                continue
+            res = self._collect_host(host, force)
+            if res is not None:
+                out.append(res)
+        return out
+
+    def _collect_host(self, host: str, force: bool) -> dict | None:
+        state = self._host_state(host)
+        stamp = state / "last-collect"
+        if not force and self._age(stamp) < COLLECT_INTERVAL:
+            return None
+        # Same lock as the bash collector (hooks, launchd): one at a time per host.
+        lock = self.home / "locks" / f"collect-{host}.lock"
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            lock.mkdir()
+        except FileExistsError:
+            if self._age(lock) <= 120:
+                return None
+            try:
+                lock.rmdir()
+                lock.mkdir()
+            except OSError:
+                return None
+        try:
+            stamp.touch()
+            pushed = pulled = 0
+            reachable = True
+            qdir = self.home / "outbox" / host
+            for f in sorted(qdir.rglob("msg-*.json")) if qdir.is_dir() else []:
+                rel = "inboxes/" + str(f.relative_to(qdir))
+                if self.remote_put(host, rel, f.read_bytes()):
+                    f.unlink()
+                    pushed += 1
+                else:
+                    reachable = False
+                    break
+            me = self.host_self()
+            if reachable and me:
+                got = self._pull(host, me)
+                if got is None:
+                    reachable = False
+                else:
+                    pulled = got
+            queued = len(list(qdir.rglob("msg-*.json"))) if qdir.is_dir() else 0
+            res = {"host": host, "at": iso_now(), "status": "ok" if reachable else "unreachable",
+                   "pushed": pushed, "pulled": pulled, "queued": queued}
+            self._atomic_write(state / "last-collect.json", res)
+            return res
+        finally:
+            try:
+                lock.rmdir()
+            except OSError:
+                pass
+
+    def _pull(self, host: str, me: str) -> int | None:
+        """Pull host:outbox/<me>/ into our inboxes. None when the host is unreachable."""
+        q = shlex.quote(f"{self.host_bus_home(host)}/outbox/{me}")
+        res = self.ssh(host, f"cd {q} 2>/dev/null || exit 0; find . -name 'msg-*.json' -type f | tar -cf - -T -")
+        if res is None or res.returncode != 0:
+            return None
+        pulled = 0
+        done: list[str] = []
+        if res.stdout:
+            try:
+                tar = tarfile.open(fileobj=io.BytesIO(res.stdout))
+                members = [m for m in tar.getmembers() if m.isfile()]
+            except tarfile.TarError:
+                return 0
+            for m in sorted(members, key=lambda m: m.name):
+                rel = m.name.removeprefix("./")
+                parts = rel.split("/")
+                # <agent>/msg.json or <agent>/@slug/msg.json, nothing else.
+                if ".." in parts or not (2 <= len(parts) <= 3) or not parts[-1].startswith("msg-"):
+                    continue
+                raw = tar.extractfile(m).read()
+                try:
+                    record = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue  # unreadable: leave it on the host
+                if not isinstance(record, dict):
+                    continue
+                if not self.agent_exists(parts[0]):
+                    continue
+                dest = self.home / "inboxes" / rel
+                if any(p.exists() for p in (dest, dest.parent / ".read" / dest.name, dest.parent / ".done" / dest.name)):
+                    done.append("./" + rel)  # an earlier pull whose remote delete failed
+                    continue
+                if dest.parent.name.startswith("@"):
+                    (dest.parent / ".read").mkdir(parents=True, exist_ok=True)
+                    (dest.parent / ".done").mkdir(parents=True, exist_ok=True)
+                self._atomic_write(dest, record)
+                if _read_json(dest) is None:
+                    continue
+                done.append("./" + rel)
+                pulled += 1
+                self._append_thread(record)
+        if done:
+            self.ssh(host, f"cd {q} && xargs rm -f", ("\n".join(done) + "\n").encode())
+        return pulled
+
+    def remote_status(self, host: str, force: bool = False) -> dict:
+        """A host's registry and pending inbox, cached REMOTE_STATUS_TTL s in
+        hosts/<host>/status.json (shared with the bash lib). A failed fetch keeps
+        the last sessions with ok=false."""
+        cache = self._host_state(host) / "status.json"
+        prev = _read_json(cache)
+        if not force and prev is not None and self._age(cache) < REMOTE_STATUS_TTL:
+            return prev
+        q = shlex.quote(self.host_bus_home(host))
+        cmd = (
+            f"cd {q} 2>/dev/null || exit 0\n"
+            "find registry -path 'registry/*.d/*.json' -type f 2>/dev/null | while read -r f; do "
+            "printf 'R\\t'; tr '\\n' ' ' < \"$f\"; echo; done\n"
+            "find inboxes -name 'msg-*.json' -type f -not -path '*/.read/*' -not -path '*/.done/*' "
+            "2>/dev/null | awk '{print \"I\\t\" $0}'"
+        )
+        res = self.ssh(host, cmd)
+        if res is not None and res.returncode == 0:
+            sessions, pending = [], []
+            for line in res.stdout.decode("utf-8", "replace").splitlines():
+                if line.startswith("R\t"):
+                    try:
+                        d = json.loads(line[2:])
+                        if isinstance(d, dict):
+                            sessions.append(d)
+                    except json.JSONDecodeError:
+                        pass
+                elif line.startswith("I\t"):
+                    pending.append(line[2:])
+            data = {"host": host, "fetched_at": iso_now(), "ok": True,
+                    "sessions": sessions, "pending": pending}
+        else:
+            data = dict(prev or {"host": host, "fetched_at": None, "sessions": [], "pending": []})
+            data.update({"ok": False, "error": "unreachable", "checked_at": iso_now()})
+        self._atomic_write(cache, data)
+        return data
+
+    def remote_sessions(self, host: str) -> list[dict]:
+        """Live sessions on a host, with pending = own queue + agent broadcasts."""
+        snap = self.remote_status(host)
+        now = datetime.now(timezone.utc)
+        out = []
+        for s in snap.get("sessions", []):
+            name, slug = s.get("name"), s.get("slug")
+            if not name or not slug:
+                continue
+            try:
+                ts = datetime.fromisoformat((s.get("last_seen") or "").replace("Z", "+00:00"))
+                if (now - ts) > timedelta(minutes=SESSION_TTL_MIN):
+                    continue
+            except ValueError:
+                pass
+            root, own = f"inboxes/{name}/", f"inboxes/{name}/@{slug}/"
+            pend = sum(1 for p in snap.get("pending", [])
+                       if p.startswith(own) or (p.startswith(root) and "/" not in p[len(root):]))
+            out.append({**s, "host": host, "pending": pend})
+        out.sort(key=lambda d: (d["name"], d.get("last_seen") or ""), reverse=False)
+        return out
+
     def routing_denied(self, sender: str, recipient: str) -> str | None:
         rules = self.agent_map().get("routing_rules", {}).get(sender, {})
         if recipient in (rules.get("deny") or []):
@@ -176,6 +500,8 @@ class Bus:
             "session_started": prev.get("session_started") or now,
             "pid": os.getpid(),
         }
+        if host := self.host_self():
+            rec["host"] = host
         self._atomic_write(f, rec)
         return rec
 
@@ -268,16 +594,19 @@ class Bus:
         context_refs: list[str] | None = None,
         requires_response: bool = False,
         response_by: str | None = None,
+        sender_session: str | None = None,
     ) -> dict:
-        agent, slug = parse_addr(to)
+        agent, slug, want_host = parse_full_addr(to)
         if not self.agent_exists(agent):
             known = ", ".join(sorted(self.agents())) or "none configured"
             raise BusError(f"unknown agent '{agent}'. Known: {known}")
         if (reason := self.routing_denied(sender, agent)) is not None:
             raise BusError(f"routing denied {sender} -> {agent} ({reason})")
+        to_host = self.resolve_host(agent, want_host)
 
         warning = None
-        if slug:
+        # Liveness is only known for this machine's registry.
+        if slug and not to_host:
             live = [s["slug"] for s in self.list_sessions(agent)]
             if live and slug not in live:
                 # Delivering into a directory nobody reads is the failure mode this
@@ -305,6 +634,28 @@ class Bus:
         }
         if response_by:
             record["response_by"] = response_by
+        if sender_session:
+            # Chi scrive, sessione compresa: due sessioni dello stesso agente
+            # (es. leo e la segretaria leo/nora) restano distinguibili. Campo in aggiunta.
+            record["from_session"] = f"{sender}/{sender_session}"
+        if me := self.host_self():
+            # v2.5: the sender's machine, so a reply finds its way back.
+            record["context"] = {"host": me}
+
+        if to_host:
+            outcome = self.deliver_remote(to_host, agent, slug, record)
+            self._append_thread(record)
+            self._append_outbox(sender, record, slug)
+            addr = f"{agent}@{to_host}" + (f"/{slug}" if slug else "")
+            if outcome == "queued":
+                if (self.hosts().get(to_host) or {}).get("ssh"):
+                    warning = (f"{to_host} unreachable now: queued in outbox/{to_host}/, "
+                               "delivered at the next collection.")
+                else:
+                    warning = (f"queued in outbox/{to_host}/: {to_host} collects it "
+                               "at its next round (it cannot be reached from here).")
+            return {"id": mid, "delivered_to": addr, "host": to_host,
+                    "queued": outcome == "queued", "path": None, "warning": warning}
 
         if slug:
             target_dir = self.session_dir(agent, slug)
@@ -320,7 +671,19 @@ class Bus:
         self._append_thread(record)
         self._append_outbox(sender, record, slug)
         return {"id": mid, "delivered_to": f"{agent}/{slug}" if slug else agent,
+                "host": self.host_self(), "queued": False,
                 "path": str(target_dir / f"{mid}.json"), "warning": warning}
+
+    def reply_address(self, record: dict) -> str:
+        """Address that reaches a message's sender: its session when known
+        (from_session) and its machine when it is not this one."""
+        sender = record.get("from") or ""
+        fs = record.get("from_session") or ""
+        host = (record.get("context") or {}).get("host")
+        slug = fs.partition("/")[2] if "/" in fs else ""
+        if host and host != self.host_self():
+            return f"{sender}@{host}" + (f"/{slug}" if slug else "")
+        return f"{sender}/{slug}" if slug else sender
 
     # ---------- threads & log ----------
 
