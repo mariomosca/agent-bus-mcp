@@ -4,6 +4,10 @@
 **Owner**: Alita. **Nato da**: bug sessioni parallele Kai, 21 set 2026.
 
 ## Fatto
+- v2.5 due macchine (14 ott 2026, ramo `feat/bus-mini`): indirizzi `agent@host[/slug]`,
+  consegna via SSH laptop→mini con coda, outbox del mini raccolta dal laptop, `bus_status`
+  con le sessioni del mini, `reply_to`. 23 test nuovi con `ssh` finto.
+- `from_session` nel messaggio (era lavoro non committato su `main`, portato sul ramo).
 - Layer filesystem (`bus.py`) con semantica allineata a bus v1.4 (`agent/slug`).
 - 6 tool MCP: status, inbox, read, send, archive, thread.
 - 19 test su AB_HOME isolato, incluso il caso che riproduce il bug.
