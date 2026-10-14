@@ -94,6 +94,7 @@ def _summarize(path: Path, data: dict, own_slug: str) -> dict:
     return {
         "id": path.stem,
         "from": data.get("from"),
+        "from_session": data.get("from_session"),
         "type": data.get("type"),
         "intent": data.get("intent"),
         "priority": data.get("priority", "normal"),
@@ -208,7 +209,7 @@ def bus_send(
     a bare name lands in the shared queue that every session reads.
     """
     bus = _bus()
-    sender, _ = _whoami(bus)
+    sender, sender_slug = _whoami(bus)
     payload: dict[str, Any] = {"summary": summary}
     if details:
         payload.update(details)
@@ -216,7 +217,7 @@ def bus_send(
         sender=sender, to=to, msg_type=message_type, intent=intent, payload=payload,
         priority=priority, thread=thread_id, in_reply_to=in_reply_to,
         context_refs=context_refs, requires_response=requires_response,
-        response_by=response_by,
+        response_by=response_by, sender_session=sender_slug,
     )
 
 

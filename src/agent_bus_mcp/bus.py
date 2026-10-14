@@ -268,6 +268,7 @@ class Bus:
         context_refs: list[str] | None = None,
         requires_response: bool = False,
         response_by: str | None = None,
+        sender_session: str | None = None,
     ) -> dict:
         agent, slug = parse_addr(to)
         if not self.agent_exists(agent):
@@ -305,6 +306,10 @@ class Bus:
         }
         if response_by:
             record["response_by"] = response_by
+        if sender_session:
+            # Chi scrive, sessione compresa: due sessioni dello stesso agente
+            # (es. leo e la segretaria leo/nora) restano distinguibili. Campo in aggiunta.
+            record["from_session"] = f"{sender}/{sender_session}"
 
         if slug:
             target_dir = self.session_dir(agent, slug)
