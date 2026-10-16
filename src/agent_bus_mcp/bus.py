@@ -159,7 +159,8 @@ class Bus:
             pattern = rule.get("pattern", "")
             if not pattern:
                 continue
-            if raw.startswith(pattern) or resolved.startswith(pattern):
+            # trailing "/" so the root of a rule like ".../07-Tooling/" matches too
+            if (raw + "/").startswith(pattern) or (resolved + "/").startswith(pattern):
                 if best is None or len(pattern) > best[0]:
                     best = (len(pattern), rule.get("agent", ""))
         return best[1] if best and best[1] else None
