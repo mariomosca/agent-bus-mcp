@@ -45,6 +45,11 @@ from pathlib import Path
 SESSION_TTL_MIN = int(os.environ.get("AB_SESSION_TTL_MIN", "240"))
 
 SLUG_SAFE = re.compile(r"[^a-z0-9._-]")
+TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{2,63}$")
+
+# v2.6: a message sent within this many minutes of a wake carries wake_chain.
+# Same name and default as agent-team-os-wake.py.
+WAKE_CHAIN_MIN = int(os.environ.get("AB_WAKE_CHAIN_MIN", "30"))
 
 # v2.5 transport knobs, same names and defaults as the bash lib.
 SSH_BIN = os.environ.get("AB_SSH_BIN", "ssh")
@@ -71,6 +76,12 @@ def thread_id() -> str:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
     rand = "".join(random.choices(string.ascii_lowercase + string.digits, k=6))
     return f"thread-{stamp}-{rand}"
+
+
+def new_task_id() -> str:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
+    rand = "".join(random.choices(string.ascii_lowercase + string.digits, k=6))
+    return f"t-{stamp}-{rand}"
 
 
 def slug_for_path(path: str | os.PathLike[str]) -> str:
@@ -596,8 +607,14 @@ class Bus:
         requires_response: bool = False,
         response_by: str | None = None,
         sender_session: str | None = None,
+        task_id: str | None = None,
     ) -> dict:
         agent, slug, want_host = parse_full_addr(to)
+        if task_id is None and in_reply_to:
+            # A reply to a delegated task carries its id even if the sender forgot it.
+            task_id = self.task_of(sender, in_reply_to)
+        if task_id is not None and not TASK_ID_RE.match(task_id):
+            raise BusError(f"invalid task_id {task_id!r}: 3-64 chars of [A-Za-z0-9._-]")
         if not self.agent_exists(agent):
             known = ", ".join(sorted(self.agents())) or "none configured"
             raise BusError(f"unknown agent '{agent}'. Known: {known}")
@@ -639,6 +656,10 @@ class Bus:
             # Chi scrive, sessione compresa: due sessioni dello stesso agente
             # (es. leo e la segretaria leo/nora) restano distinguibili. Campo in aggiunta.
             record["from_session"] = f"{sender}/{sender_session}"
+            if chain := self.wake_chain(sender, sender_session):
+                record["wake_chain"] = chain
+        if task_id:
+            record["task_id"] = task_id
         if me := self.host_self():
             # v2.5: the sender's machine, so a reply finds its way back.
             record["context"] = {"host": me}
@@ -656,7 +677,8 @@ class Bus:
                     warning = (f"queued in outbox/{to_host}/: {to_host} collects it "
                                "at its next round (it cannot be reached from here).")
             return {"id": mid, "delivered_to": addr, "host": to_host,
-                    "queued": outcome == "queued", "path": None, "warning": warning}
+                    "queued": outcome == "queued", "path": None, "warning": warning,
+                    "task_id": task_id}
 
         if slug:
             target_dir = self.session_dir(agent, slug)
@@ -673,7 +695,93 @@ class Bus:
         self._append_outbox(sender, record, slug)
         return {"id": mid, "delivered_to": f"{agent}/{slug}" if slug else agent,
                 "host": self.host_self(), "queued": False,
-                "path": str(target_dir / f"{mid}.json"), "warning": warning}
+                "path": str(target_dir / f"{mid}.json"), "warning": warning,
+                "task_id": task_id}
+
+    # ---------- expected results (v2.6) ----------
+    #
+    # Same files as agent-team-os/scripts/agent-team-os-wake.py, which owns the
+    # wake itself: this side only registers, lists and stamps.
+
+    def waits_root(self) -> Path:
+        return self.home / "waits"
+
+    def wait_dir(self, agent: str, slug: str) -> Path:
+        return self.waits_root() / agent / f"@{slug}"
+
+    def find_wait(self, task_id: str) -> Path | None:
+        root = self.waits_root()
+        if not root.is_dir():
+            return None
+        return next(iter(root.glob(f"*/@*/{task_id}.json")), None)
+
+    def expect(self, agent: str, slug: str, description: str, delegated_to: str | None = None,
+               deadline: str | None = None, task_id: str | None = None,
+               target: dict | None = None) -> dict:
+        """Register an expected result on a session. One waiter per task_id, bus-wide:
+        that is what keeps A→B→A from waking in a loop."""
+        task_id = task_id or new_task_id()
+        if not TASK_ID_RE.match(task_id):
+            raise BusError(f"invalid task_id {task_id!r}: 3-64 chars of [A-Za-z0-9._-]")
+        if deadline:
+            try:
+                datetime.fromisoformat(deadline.replace("Z", "+00:00"))
+            except ValueError:
+                raise BusError(f"deadline is not ISO 8601: {deadline!r}") from None
+        if (existing := self.find_wait(task_id)) is not None:
+            raise BusError(f"task {task_id} already has a waiter "
+                           f"({existing.parent.parent.name}/{existing.parent.name[1:]}): one task, one waiter")
+        rec = {
+            "v": 1,
+            "task_id": task_id,
+            "agent": agent,
+            "slug": slug,
+            "host": self.host_self(),
+            "description": description.strip()[:200],
+            "delegated_to": delegated_to,
+            "created_at": iso_now(),
+            "deadline": deadline,
+            "state": "expected",
+            "target": {k: v for k, v in (target or {}).items() if v},
+        }
+        self._atomic_write(self.wait_dir(agent, slug) / f"{task_id}.json", rec)
+        return rec
+
+    def list_waits(self, agent: str, slug: str | None = None, include_closed: bool = False) -> list[dict]:
+        root = self.waits_root()
+        if not root.is_dir():
+            return []
+        out = []
+        for p in sorted(root.glob(f"{agent}/@{slug or '*'}/*.json")):
+            rec = _read_json(p)
+            if not rec or not rec.get("task_id"):
+                continue
+            if not include_closed and rec.get("state") not in ("expected", "expired"):
+                continue
+            out.append(rec)
+        return out
+
+    def wake_chain(self, agent: str, slug: str) -> dict | None:
+        """The wake that touched this session in the last WAKE_CHAIN_MIN minutes, if any.
+        A message sent meanwhile carries it, and the wake script will not let it wake
+        anyone else: depth 1 per chain."""
+        rec = _read_json(self.wait_dir(agent, slug) / ".woken.json")
+        if not rec or not rec.get("at"):
+            return None
+        try:
+            at = datetime.fromisoformat(rec["at"].replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if datetime.now(timezone.utc) - at > timedelta(minutes=WAKE_CHAIN_MIN):
+            return None
+        return {"task_id": rec.get("task_id"), "at": rec["at"], "session": f"{agent}/{slug}"}
+
+    def task_of(self, agent: str, message_id: str) -> str | None:
+        """task_id carried by a message in this agent's inbox (pending or archived)."""
+        path = self.resolve_message(agent, message_id)
+        data = _read_json(path) if path else None
+        tid = (data or {}).get("task_id") or ((data or {}).get("payload") or {}).get("task_id")
+        return tid if isinstance(tid, str) else None
 
     def reply_address(self, record: dict) -> str:
         """Address that reaches a message's sender: its session when known
