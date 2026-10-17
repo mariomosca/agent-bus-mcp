@@ -18,6 +18,10 @@ espone come API di prima classe.
 | `bus_send` | invia a `kai` (tutte le sessioni), `kai/noi-calendar` (una sola), `kai@mini/crewmoor` (sull'altra macchina) |
 | `bus_archive` | sposta in `.done/` o `.read/` **accanto** al messaggio, non nella radice |
 | `bus_thread` | rigioca una conversazione in ordine |
+| `bus_expect` | (v2.6) registra un esito atteso su questa sessione quando deleghi senza `bus_send` (es. `onda_agent_prompt`); restituisce `task_id` e la riga da mettere in fondo al prompt |
+| `bus_waits` | (v2.6) gli esiti che questa sessione aspetta, con età, scadenza e motivo di una sveglia rimandata |
+
+`bus_send` ha `task_id` ed `expect_result` (v2.6): con `expect_result=true` registra l'atteso e, quando arriva la risposta con lo stesso `task_id` e la sessione è idle, `agent-team-os-wake.py` (repo agent-team-os) la sveglia una volta. Una risposta con `in_reply_to` eredita il `task_id`. Chi spedisce entro 30 min da una sveglia timbra `wake_chain`: quel messaggio non sveglia nessuno.
 
 ## Indirizzamento
 
