@@ -4,6 +4,10 @@
 **Owner**: Alita. **Nato da**: bug sessioni parallele Kai, 21 set 2026.
 
 ## Fatto
+- v2.6 esiti attesi (17 ott 2026, ramo `feat/hook-di-ritorno`, piano F4): `task_id` ed
+  `expect_result` su `bus_send`, eredità da `in_reply_to`, tool `bus_expect` e `bus_waits`,
+  timbro `wake_chain`, giro immediato della sveglia dopo un esito. 8 tool, 54 test. Prova reale
+  sul mini via tmux: sveglia, testo in casella, sessione occupata, catena, scadenza.
 - v2.5 due macchine (14 ott 2026, ramo `feat/bus-mini`): indirizzi `agent@host[/slug]`,
   consegna via SSH laptop→mini con coda, outbox del mini raccolta dal laptop, `bus_status`
   con le sessioni del mini, `reply_to`. 23 test nuovi con `ssh` finto.
