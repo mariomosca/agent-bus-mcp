@@ -100,4 +100,5 @@ def test_list_waits_hides_closed(bus: Bus):
     f = bus.home / "waits" / "alita" / "@work-hub" / f"{b['task_id']}.json"
     rec = json.loads(f.read_text()); rec["state"] = "woken"; f.write_text(json.dumps(rec))
     assert [w["task_id"] for w in bus.list_waits("alita", "work-hub")] == [a["task_id"]]
+    (f.parent / ".woken.json").write_text(json.dumps({"task_id": b["task_id"], "at": "2026-10-17T10:00:00Z"}))
     assert len(bus.list_waits("alita", None, include_closed=True)) == 2

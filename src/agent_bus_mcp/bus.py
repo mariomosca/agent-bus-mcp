@@ -753,6 +753,8 @@ class Bus:
             return []
         out = []
         for p in sorted(root.glob(f"{agent}/@{slug or '*'}/*.json")):
+            if p.name.startswith("."):
+                continue  # .woken.json and friends belong to the wake script
             rec = _read_json(p)
             if not rec or not rec.get("task_id"):
                 continue
