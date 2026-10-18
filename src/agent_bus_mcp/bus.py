@@ -514,6 +514,8 @@ class Bus:
         }
         if host := self.host_self():
             rec["host"] = host
+        if prev.get("waiting_agent"):
+            rec["waiting_agent"] = prev["waiting_agent"]  # v2.7: the heartbeat keeps it
         self._atomic_write(f, rec)
         return rec
 
@@ -664,6 +666,20 @@ class Bus:
             # v2.5: the sender's machine, so a reply finds its way back.
             record["context"] = {"host": me}
 
+        if sender_session and task_id:
+            if msg_type == "question":
+                dest = f"{agent}@{to_host}" if to_host else agent
+                self.set_waiting_agent(sender, sender_session, {
+                    "agent": agent,
+                    "address": dest + (f"/{slug}" if slug else ""),
+                    "task_id": task_id,
+                    "msg_id": mid,
+                    "since": record["ts"],
+                    "summary": " ".join(str(payload.get("summary") or "").split())[:160],
+                })
+            elif msg_type == "response":
+                self.clear_waiting_agent(sender, sender_session, task_id=task_id)
+
         if to_host:
             outcome = self.deliver_remote(to_host, agent, slug, record)
             self._append_thread(record)
@@ -785,6 +801,41 @@ class Bus:
         tid = (data or {}).get("task_id") or ((data or {}).get("payload") or {}).get("task_id")
         return tid if isinstance(tid, str) else None
 
+    # ---------- waiting on another agent (v2.7) ----------
+    #
+    # A session that asks a question inside a delegation (type question + task_id)
+    # carries registry/<agent>.d/<slug>.json → waiting_agent until the answer is
+    # read, the task result is sent, or the session ends. Orbit's Ufficio shows it.
+
+    def set_waiting_agent(self, agent: str, slug: str, info: dict) -> None:
+        f = self.registry_dir(agent) / f"{slug}.json"
+        rec = _read_json(f)
+        if rec is None:
+            return  # no registry entry (session not registered here): nothing to mark
+        rec["waiting_agent"] = info
+        self._atomic_write(f, rec)
+
+    def clear_waiting_agent(self, agent: str, slug: str, task_id: str | None = None,
+                            answer: dict | None = None) -> bool:
+        """Drop waiting_agent when the task closes (task_id) or the answer is read (answer)."""
+        f = self.registry_dir(agent) / f"{slug}.json"
+        rec = _read_json(f)
+        w = (rec or {}).get("waiting_agent")
+        if not isinstance(w, dict):
+            return False
+        if answer is not None:
+            if answer.get("from") != w.get("agent"):
+                return False
+            same = (answer.get("in_reply_to") == w.get("msg_id")
+                    or (answer.get("task_id") and answer.get("task_id") == w.get("task_id")))
+            if not same:
+                return False
+        elif task_id and task_id != w.get("task_id"):
+            return False
+        rec.pop("waiting_agent", None)
+        self._atomic_write(f, rec)
+        return True
+
     def reply_address(self, record: dict) -> str:
         """Address that reaches a message's sender: its session when known
         (from_session) and its machine when it is not this one."""
@@ -816,7 +867,8 @@ class Bus:
     def _append_thread(self, record: dict) -> None:
         d = self.home / "threads"
         d.mkdir(parents=True, exist_ok=True)
-        entry = {k: record[k] for k in ("id", "from", "to", "type", "intent", "ts") if k in record}
+        entry = {k: record[k] for k in ("id", "from", "to", "type", "intent", "ts", "in_reply_to", "task_id")
+                 if record.get(k) is not None}
         entry["summary"] = (record.get("payload") or {}).get("summary", "")
         with (d / f"{record['thread_id']}.jsonl").open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(entry, ensure_ascii=False) + "\n")

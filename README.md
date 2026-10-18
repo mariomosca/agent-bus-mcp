@@ -19,9 +19,11 @@ espone come API di prima classe.
 | `bus_archive` | sposta in `.done/` o `.read/` **accanto** al messaggio, non nella radice |
 | `bus_thread` | rigioca una conversazione in ordine |
 | `bus_expect` | (v2.6) registra un esito atteso su questa sessione quando deleghi senza `bus_send` (es. `onda_agent_prompt`); restituisce `task_id` e la riga da mettere in fondo al prompt |
-| `bus_waits` | (v2.6) gli esiti che questa sessione aspetta, con età, scadenza e motivo di una sveglia rimandata |
+| `bus_waits` | (v2.6) gli esiti che questa sessione aspetta, con età, scadenza e motivo di una sveglia rimandata; (v2.7) `waiting_on_you`, le domande dell'esecutore ancora senza risposta |
 
 `bus_send` ha `task_id` ed `expect_result` (v2.6): con `expect_result=true` registra l'atteso e, quando arriva la risposta con lo stesso `task_id` e la sessione è idle, `agent-team-os-wake.py` (repo agent-team-os) la sveglia una volta. Una risposta con `in_reply_to` eredita il `task_id`. Chi spedisce entro 30 min da una sveglia timbra `wake_chain`: quel messaggio non sveglia nessuno.
+
+Domande (v2.7): chi esegue chiede al delegante con `message_type='question'` e lo stesso `task_id` (con `in_reply_to` sulla delega lo eredita). Ogni domanda sveglia il delegante una volta, l'esito lo sveglia comunque dopo. Chi chiede ha `waiting_agent` (`agent`, `address`, `task_id`, `msg_id`, `since`, `summary`) nella sua voce `registry/<agent>.d/<slug>.json` finché non legge la risposta (`bus_read`) o non manda l'esito.
 
 ## Indirizzamento
 

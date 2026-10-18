@@ -102,3 +102,78 @@ def test_list_waits_hides_closed(bus: Bus):
     assert [w["task_id"] for w in bus.list_waits("alita", "work-hub")] == [a["task_id"]]
     (f.parent / ".woken.json").write_text(json.dumps({"task_id": b["task_id"], "at": "2026-10-17T10:00:00Z"}))
     assert len(bus.list_waits("alita", None, include_closed=True)) == 2
+
+
+# ---------- v2.7: questions inside a delegation (DR18-F1.7) ----------
+
+def _registered(bus: Bus, agent: str, slug: str) -> Path:
+    bus.register_session(agent, f"/w/{slug}", slug)
+    return bus.registry_dir(agent) / f"{slug}.json"
+
+
+def test_question_with_task_id_marks_waiting_agent(bus: Bus):
+    reg = _registered(bus, "kai", "f3")
+    q = bus.send(sender="kai", to="alita/work-hub", msg_type="question", intent="domanda",
+                 payload={"summary": "uso il tema   scuro?"}, sender_session="f3", task_id="t-1-abc")
+    w = json.loads(reg.read_text())["waiting_agent"]
+    assert w == {"agent": "alita", "address": "alita/work-hub", "task_id": "t-1-abc",
+                 "msg_id": q["id"], "since": w["since"], "summary": "uso il tema scuro?"}
+    # the heartbeat keeps it
+    bus.register_session("kai", "/w/f3", "f3")
+    assert "waiting_agent" in json.loads(reg.read_text())
+
+
+def test_question_without_task_id_marks_nothing(bus: Bus):
+    reg = _registered(bus, "kai", "f3")
+    bus.send(sender="kai", to="alita/work-hub", msg_type="question", intent="domanda",
+             payload={"summary": "?"}, sender_session="f3")
+    assert "waiting_agent" not in json.loads(reg.read_text())
+
+
+def test_question_inherits_task_id_from_in_reply_to(bus: Bus):
+    reg = _registered(bus, "kai", "f3")
+    d = bus.send(sender="alita", to="kai/f3", msg_type="request", intent="delega",
+                 payload={"summary": "fai"}, sender_session="work-hub", task_id="t-1-abc")
+    q = bus.send(sender="kai", to="alita/work-hub", msg_type="question", intent="domanda",
+                 payload={"summary": "?"}, sender_session="f3", in_reply_to=d["id"])
+    assert q["task_id"] == "t-1-abc"
+    assert json.loads(reg.read_text())["waiting_agent"]["task_id"] == "t-1-abc"
+
+
+def test_reading_the_answer_clears_waiting_agent(bus: Bus):
+    reg = _registered(bus, "kai", "f3")
+    q = bus.send(sender="kai", to="alita/work-hub", msg_type="question", intent="domanda",
+                 payload={"summary": "?"}, sender_session="f3", task_id="t-1-abc")
+    a = bus.send(sender="alita", to="kai/f3", msg_type="response", intent="risposta",
+                 payload={"summary": "sì"}, sender_session="work-hub", in_reply_to=q["id"])
+    data = bus.read_message("kai", a["id"])
+    assert bus.clear_waiting_agent("kai", "f3", answer=data) is True
+    assert "waiting_agent" not in json.loads(reg.read_text())
+
+
+def test_unrelated_message_keeps_waiting_agent(bus: Bus):
+    reg = _registered(bus, "kai", "f3")
+    bus.send(sender="kai", to="alita/work-hub", msg_type="question", intent="domanda",
+             payload={"summary": "?"}, sender_session="f3", task_id="t-1-abc")
+    m = bus.send(sender="alita", to="kai/f3", msg_type="brief", intent="altro",
+                 payload={"summary": "altro"}, sender_session="work-hub")
+    assert bus.clear_waiting_agent("kai", "f3", answer=bus.read_message("kai", m["id"])) is False
+    assert "waiting_agent" in json.loads(reg.read_text())
+
+
+def test_sending_the_result_clears_waiting_agent(bus: Bus):
+    reg = _registered(bus, "kai", "f3")
+    bus.send(sender="kai", to="alita/work-hub", msg_type="question", intent="domanda",
+             payload={"summary": "?"}, sender_session="f3", task_id="t-1-abc")
+    bus.send(sender="kai", to="alita/work-hub", msg_type="response", intent="esito",
+             payload={"summary": "fatto"}, sender_session="f3", task_id="t-1-abc")
+    assert "waiting_agent" not in json.loads(reg.read_text())
+
+
+def test_thread_entry_carries_in_reply_to_and_task_id(bus: Bus):
+    q = bus.send(sender="kai", to="alita/work-hub", msg_type="question", intent="domanda",
+                 payload={"summary": "?"}, sender_session="f3", task_id="t-1-abc")
+    rec = json.loads(Path(q["path"]).read_text())
+    entry = bus.thread(rec["thread_id"])[-1]
+    assert entry["task_id"] == "t-1-abc"
+    assert "in_reply_to" not in entry
