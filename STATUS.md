@@ -4,6 +4,11 @@
 **Owner**: Alita. **Nato da**: bug sessioni parallele Kai, 21 set 2026.
 
 ## Fatto
+- v2.8 deleghe dichiarate (21 ott 2026, piano BS21, ramo `feat/bs21-deleghe`): `kind` obbligatorio
+  (delega | comunicazione) su request/brief/handoff, la delega registra l'attesa da sola,
+  `bus_gestisci` (chiuso, riarma, risposto, letto), `bus_inbox`/`bus_read` mostrano kind e aggancio,
+  `bus_waits.unhandled_returns`. 9 tool, 80 test. Aggancio, sveglia a ogni ritorno, tetti e misura
+  stanno in agent-team-os (`agent-team-os-wake.py`).
 - v2.7 domande nella delega (18 ott 2026, DR18-F1.7): una `question` con il `task_id` della
   delega sveglia il delegante (una volta per domanda, la sveglia la fa agent-team-os-wake.py)
   senza consumare l'attesa dell'esito; chi chiede porta `waiting_agent` nella voce di registro
