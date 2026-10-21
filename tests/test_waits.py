@@ -61,7 +61,7 @@ def test_send_carries_task_id(bus: Bus):
 
 def test_reply_inherits_task_id(bus: Bus):
     req = bus.send(sender="alita", to="kai/f3", msg_type="request", intent="spike",
-                   payload={"summary": "fai lo spike"}, sender_session="work-hub", task_id="t-1-abc")
+                   payload={"summary": "fai lo spike"}, sender_session="work-hub", task_id="t-1-abc", kind="delega")
     out = bus.send(sender="kai", to="alita/work-hub", msg_type="response", intent="esito",
                    payload={"summary": "fatto"}, sender_session="f3", in_reply_to=req["id"])
     assert out["task_id"] == "t-1-abc"
@@ -133,7 +133,7 @@ def test_question_without_task_id_marks_nothing(bus: Bus):
 def test_question_inherits_task_id_from_in_reply_to(bus: Bus):
     reg = _registered(bus, "kai", "f3")
     d = bus.send(sender="alita", to="kai/f3", msg_type="request", intent="delega",
-                 payload={"summary": "fai"}, sender_session="work-hub", task_id="t-1-abc")
+                 payload={"summary": "fai"}, sender_session="work-hub", task_id="t-1-abc", kind="delega")
     q = bus.send(sender="kai", to="alita/work-hub", msg_type="question", intent="domanda",
                  payload={"summary": "?"}, sender_session="f3", in_reply_to=d["id"])
     assert q["task_id"] == "t-1-abc"
@@ -156,7 +156,7 @@ def test_unrelated_message_keeps_waiting_agent(bus: Bus):
     bus.send(sender="kai", to="alita/work-hub", msg_type="question", intent="domanda",
              payload={"summary": "?"}, sender_session="f3", task_id="t-1-abc")
     m = bus.send(sender="alita", to="kai/f3", msg_type="brief", intent="altro",
-                 payload={"summary": "altro"}, sender_session="work-hub")
+                 payload={"summary": "altro"}, sender_session="work-hub", kind="comunicazione")
     assert bus.clear_waiting_agent("kai", "f3", answer=bus.read_message("kai", m["id"])) is False
     assert "waiting_agent" in json.loads(reg.read_text())
 
@@ -177,3 +177,75 @@ def test_thread_entry_carries_in_reply_to_and_task_id(bus: Bus):
     entry = bus.thread(rec["thread_id"])[-1]
     assert entry["task_id"] == "t-1-abc"
     assert "in_reply_to" not in entry
+
+
+# ---------- BS21: declared kind, delegation = wait (BS21-F1.1, F1.2) ----------
+
+@pytest.mark.parametrize("mtype", ["request", "brief", "handoff"])
+def test_declared_types_refuse_a_send_without_kind(bus: Bus, mtype: str):
+    with pytest.raises(BusError, match="'delega' if you want the outcome back"):
+        bus.send(sender="alita", to="kai", msg_type=mtype, intent="x", payload={"summary": "s"},
+                 sender_session="work-hub")
+    assert not list((bus.home / "inboxes").rglob("msg-*.json"))
+
+
+@pytest.mark.parametrize("mtype", ["response", "question", "event"])
+def test_returns_need_no_kind(bus: Bus, mtype: str):
+    out = bus.send(sender="kai", to="alita", msg_type=mtype, intent="x", payload={"summary": "s"})
+    assert "kind" not in json.loads(Path(out["path"]).read_text())
+
+
+def test_bad_kind_and_delegating_response_refused(bus: Bus):
+    with pytest.raises(BusError, match="kind must be"):
+        bus.send(sender="alita", to="kai", msg_type="request", intent="x", payload={"summary": "s"},
+                 kind="forse")
+    with pytest.raises(BusError, match="cannot be a delegation"):
+        bus.send(sender="kai", to="alita", msg_type="response", intent="x", payload={"summary": "s"},
+                 sender_session="f3", kind="delega")
+
+
+def test_comunicazione_registers_nothing(bus: Bus):
+    out = bus.send(sender="kai", to="alita", msg_type="brief", intent="nota", payload={"summary": "s"},
+                   sender_session="f3", kind="comunicazione")
+    rec = json.loads(Path(out["path"]).read_text())
+    assert rec["kind"] == "comunicazione" and "task_id" not in rec
+    assert out["task_id"] is None and "expecting" not in out
+    assert not (bus.home / "waits").exists()
+
+
+def test_delega_registers_the_wait_between_any_two_agents(bus: Bus):
+    # kai delegates to alita: no roles, the rule is the same both ways.
+    out = bus.send(sender="kai", to="alita/work-hub", msg_type="request", intent="review",
+                   payload={"summary": "guarda il diff"}, sender_session="f3", kind="delega",
+                   target={"onda_terminal_id": "pane-9"})
+    tid = out["task_id"]
+    assert tid.startswith("t-") and out["expecting"]["task_id"] == tid
+    assert out["note"].startswith(f"attesa registrata {tid}")
+    msg = json.loads(Path(out["path"]).read_text())
+    assert msg["kind"] == "delega" and msg["task_id"] == tid and msg["requires_response"] is True
+    wait = json.loads((bus.home / "waits" / "kai" / "@f3" / f"{tid}.json").read_text())
+    assert wait["state"] == "expected" and wait["delegated_to"] == "alita/work-hub"
+    assert wait["delegation"] == {"msg_id": msg["id"], "thread_id": msg["thread_id"]}
+    assert wait["target"] == {"onda_terminal_id": "pane-9"}
+
+
+def test_delega_keeps_a_given_task_id_and_deadline(bus: Bus):
+    out = bus.send(sender="alita", to="kai", msg_type="brief", intent="x", payload={"summary": "s"},
+                   sender_session="work-hub", kind="delega", task_id="t-1-abc",
+                   response_by="2026-10-30T18:00:00Z")
+    assert out["task_id"] == "t-1-abc"
+    wait = json.loads((bus.home / "waits" / "alita" / "@work-hub" / "t-1-abc.json").read_text())
+    assert wait["deadline"] == "2026-10-30T18:00:00Z"
+
+
+def test_failed_delega_leaves_no_wait(bus: Bus):
+    with pytest.raises(BusError, match="unknown agent"):
+        bus.send(sender="alita", to="nessuno", msg_type="request", intent="x", payload={"summary": "s"},
+                 sender_session="work-hub", kind="delega")
+    assert not list(bus.home.glob("waits/*/@*/t-*.json"))
+
+
+def test_delega_needs_the_sender_session(bus: Bus):
+    with pytest.raises(BusError, match="sender's session"):
+        bus.send(sender="alita", to="kai", msg_type="request", intent="x", payload={"summary": "s"},
+                 kind="delega")

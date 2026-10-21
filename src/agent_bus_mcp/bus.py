@@ -47,6 +47,17 @@ SESSION_TTL_MIN = int(os.environ.get("AB_SESSION_TTL_MIN", "240"))
 SLUG_SAFE = re.compile(r"[^a-z0-9._-]")
 TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{2,63}$")
 
+# BS21: request, brief and handoff must say what they are. "delega" = the sender wants
+# the outcome back and waits for it (a wait is registered on its own); "comunicazione"
+# = nothing comes back. No default: the choice is the sender's, never a guess.
+DECLARED_TYPES = ("request", "brief", "handoff")
+KINDS = ("delega", "comunicazione")
+KIND_HELP = (
+    "say what this {type} is with kind: 'delega' if you want the outcome back (the bus "
+    "registers the wait and wakes you on every return), 'comunicazione' if nothing "
+    "has to come back. There is no default."
+)
+
 # v2.6: a message sent within this many minutes of a wake carries wake_chain.
 # Same name and default as agent-team-os-wake.py.
 WAKE_CHAIN_MIN = int(os.environ.get("AB_WAKE_CHAIN_MIN", "30"))
@@ -610,9 +621,14 @@ class Bus:
         response_by: str | None = None,
         sender_session: str | None = None,
         task_id: str | None = None,
+        kind: str | None = None,
+        target: dict | None = None,
     ) -> dict:
         agent, slug, want_host = parse_full_addr(to)
-        if task_id is None and in_reply_to:
+        kind = self.check_kind(msg_type, kind)
+        if kind == "delega" and not sender_session:
+            raise BusError("a delegation needs the sender's session, to know whom to wake")
+        if task_id is None and in_reply_to and kind != "delega":
             # A reply to a delegated task carries its id even if the sender forgot it.
             task_id = self.task_of(sender, in_reply_to)
         if task_id is not None and not TASK_ID_RE.match(task_id):
@@ -637,12 +653,22 @@ class Bus:
                 )
 
         mid = msg_id()
+        thread = thread or thread_id()
+        wait = None
+        if kind == "delega":
+            # Registered before the message exists, so a fast executor never
+            # answers a task nobody waits for. Undone below if delivery fails.
+            wait = self.expect(sender, sender_session, f"{intent}: {payload.get('summary') or ''}",
+                               delegated_to=to, deadline=response_by, task_id=task_id,
+                               target=target, delegation={"msg_id": mid, "thread_id": thread})
+            task_id = wait["task_id"]
+            requires_response = True
         record = {
             "id": mid,
             "version": "1.0",
             "from": sender,
             "to": agent,  # bare name: readers and threads stay unchanged
-            "thread_id": thread or thread_id(),
+            "thread_id": thread,
             "in_reply_to": in_reply_to,
             "type": msg_type,
             "intent": intent,
@@ -662,6 +688,8 @@ class Bus:
                 record["wake_chain"] = chain
         if task_id:
             record["task_id"] = task_id
+        if kind:
+            record["kind"] = kind
         if me := self.host_self():
             # v2.5: the sender's machine, so a reply finds its way back.
             record["context"] = {"host": me}
@@ -680,6 +708,21 @@ class Bus:
             elif msg_type == "response":
                 self.clear_waiting_agent(sender, sender_session, task_id=task_id)
 
+        try:
+            out = self._deliver(record, sender, agent, slug, to_host, warning)
+        except Exception:
+            if wait:
+                self.wait_dir(sender, sender_session).joinpath(f"{task_id}.json").unlink(missing_ok=True)
+            raise
+        if wait:
+            out["expecting"] = {"task_id": task_id, "deadline": wait["deadline"]}
+            out["note"] = (f"attesa registrata {task_id}: ogni ritorno di {to} su questo task "
+                           "ti sveglia se sei fermo")
+        return out
+
+    def _deliver(self, record: dict, sender: str, agent: str, slug: str | None,
+                 to_host: str | None, warning: str | None) -> dict:
+        mid, task_id = record["id"], record.get("task_id")
         if to_host:
             outcome = self.deliver_remote(to_host, agent, slug, record)
             self._append_thread(record)
@@ -714,6 +757,21 @@ class Bus:
                 "path": str(target_dir / f"{mid}.json"), "warning": warning,
                 "task_id": task_id}
 
+    @staticmethod
+    def check_kind(msg_type: str, kind: str | None) -> str | None:
+        """The declared kind of a send, or BusError. Only request, brief and handoff
+        carry one, and for them it is mandatory."""
+        if kind is not None and kind not in KINDS:
+            raise BusError(f"kind must be 'delega' or 'comunicazione', not {kind!r}")
+        if msg_type in DECLARED_TYPES:
+            if kind is None:
+                raise BusError(KIND_HELP.format(type=msg_type))
+            return kind
+        if kind == "delega":
+            raise BusError(f"a {msg_type} cannot be a delegation: send a request, brief or "
+                           "handoff with kind='delega'")
+        return None  # response, question, event: the kind is implied
+
     # ---------- expected results (v2.6) ----------
     #
     # Same files as agent-team-os/scripts/agent-team-os-wake.py, which owns the
@@ -733,7 +791,7 @@ class Bus:
 
     def expect(self, agent: str, slug: str, description: str, delegated_to: str | None = None,
                deadline: str | None = None, task_id: str | None = None,
-               target: dict | None = None) -> dict:
+               target: dict | None = None, delegation: dict | None = None) -> dict:
         """Register an expected result on a session. One waiter per task_id, bus-wide:
         that is what keeps A→B→A from waking in a loop."""
         task_id = task_id or new_task_id()
@@ -760,6 +818,10 @@ class Bus:
             "state": "expected",
             "target": {k: v for k, v in (target or {}).items() if v},
         }
+        if delegation:
+            # BS21: the delegation message and its thread, for hooking returns that
+            # come back as new messages (agent-team-os-wake.py).
+            rec["delegation"] = {k: v for k, v in delegation.items() if v}
         self._atomic_write(self.wait_dir(agent, slug) / f"{task_id}.json", rec)
         return rec
 

@@ -68,7 +68,7 @@ def test_two_sessions_do_not_overwrite_each_other(bus: Bus):
 def test_targeted_message_reaches_only_its_session(bus: Bus):
     bus.register_session("kai", "/w/Projects/02-Experiments/noi-calendar")
     bus.register_session("kai", "/w/Projects/07-Tooling/mcp/microsoft-mcp")
-    bus.send("alita", "kai/noi-calendar", "brief", "new-app", {"summary": "for noi-calendar"})
+    bus.send("alita", "kai/noi-calendar", "brief", "new-app", {"summary": "for noi-calendar"}, kind="comunicazione")
 
     assert bus.count_inbox("kai", "noi-calendar") == 1
     assert bus.count_inbox("kai", "microsoft-mcp") == 0
@@ -85,7 +85,7 @@ def test_broadcast_is_visible_to_every_session(bus: Bus):
 
 def test_session_sees_its_own_plus_broadcast(bus: Bus):
     bus.register_session("kai", "/w/Projects/02-Experiments/noi-calendar")
-    bus.send("alita", "kai/noi-calendar", "brief", "new-app", {"summary": "mine"})
+    bus.send("alita", "kai/noi-calendar", "brief", "new-app", {"summary": "mine"}, kind="comunicazione")
     bus.send("alita", "kai", "event", "event", {"summary": "shared"})
 
     seen = {
@@ -98,37 +98,37 @@ def test_session_sees_its_own_plus_broadcast(bus: Bus):
 # ---------- delivery mechanics ----------
 
 def test_recipient_field_keeps_bare_agent_name(bus: Bus):
-    res = bus.send("alita", "kai/noi-calendar", "brief", "x", {"summary": "s"})
+    res = bus.send("alita", "kai/noi-calendar", "brief", "x", {"summary": "s"}, kind="comunicazione")
     assert json.loads(Path(res["path"]).read_text())["to"] == "kai"
 
 
 def test_session_dir_is_born_with_its_archives(bus: Bus):
-    bus.send("alita", "kai/never-seen", "brief", "x", {"summary": "s"})
+    bus.send("alita", "kai/never-seen", "brief", "x", {"summary": "s"}, kind="comunicazione")
     d = bus.session_dir("kai", "never-seen")
     assert (d / ".read").is_dir() and (d / ".done").is_dir()
 
 
 def test_unknown_live_session_warns_but_still_delivers(bus: Bus):
     bus.register_session("kai", "/w/Projects/02-Experiments/noi-calendar")
-    res = bus.send("alita", "kai/typo-here", "brief", "x", {"summary": "s"})
+    res = bus.send("alita", "kai/typo-here", "brief", "x", {"summary": "s"}, kind="comunicazione")
     assert res["warning"] is not None and "typo-here" in res["warning"]
     assert Path(res["path"]).is_file()
 
 
 def test_unknown_agent_is_refused(bus: Bus):
     with pytest.raises(BusError, match="unknown agent"):
-        bus.send("alita", "nobody", "brief", "x", {"summary": "s"})
+        bus.send("alita", "nobody", "brief", "x", {"summary": "s"}, kind="comunicazione")
 
 
 def test_routing_deny_is_enforced(bus: Bus):
     with pytest.raises(BusError, match="routing denied"):
-        bus.send("nico", "kai", "brief", "x", {"summary": "s"})
+        bus.send("nico", "kai", "brief", "x", {"summary": "s"}, kind="comunicazione")
 
 
 # ---------- archiving ----------
 
 def test_archive_keeps_message_in_its_own_session_dir(bus: Bus):
-    bus.send("alita", "kai/noi-calendar", "brief", "x", {"summary": "s"})
+    bus.send("alita", "kai/noi-calendar", "brief", "x", {"summary": "s"}, kind="comunicazione")
     mid = bus.list_inbox("kai", "noi-calendar")[0].stem
     dest = bus.archive_message("kai", mid, "done")
 
@@ -137,21 +137,21 @@ def test_archive_keeps_message_in_its_own_session_dir(bus: Bus):
 
 
 def test_archiving_twice_is_not_an_error(bus: Bus):
-    bus.send("alita", "kai", "brief", "x", {"summary": "s"})
+    bus.send("alita", "kai", "brief", "x", {"summary": "s"}, kind="comunicazione")
     mid = bus.list_inbox("kai")[0].stem
     first = bus.archive_message("kai", mid, "done")
     assert bus.archive_message("kai", mid, "done") == first
 
 
 def test_read_finds_archived_messages(bus: Bus):
-    bus.send("alita", "kai/noi-calendar", "brief", "x", {"summary": "findable"})
+    bus.send("alita", "kai/noi-calendar", "brief", "x", {"summary": "findable"}, kind="comunicazione")
     mid = bus.list_inbox("kai", "noi-calendar")[0].stem
     bus.archive_message("kai", mid, "done")
     assert bus.read_message("kai", mid)["payload"]["summary"] == "findable"
 
 
 def test_read_reports_where_the_message_lives(bus: Bus):
-    bus.send("alita", "kai/noi-calendar", "brief", "x", {"summary": "s"})
+    bus.send("alita", "kai/noi-calendar", "brief", "x", {"summary": "s"}, kind="comunicazione")
     mid = bus.list_inbox("kai", "noi-calendar")[0].stem
     loc = bus.read_message("kai", mid)["_location"]
     assert loc["scope"] == "noi-calendar" and loc["state"] == "pending"
@@ -165,9 +165,9 @@ def test_missing_message_is_refused(bus: Bus):
 # ---------- threads ----------
 
 def test_thread_replays_in_order(bus: Bus):
-    first = bus.send("alita", "kai", "request", "x", {"summary": "one"})
+    first = bus.send("alita", "kai", "request", "x", {"summary": "one"}, kind="comunicazione")
     tid = json.loads(Path(first["path"]).read_text())["thread_id"]
-    bus.send("alita", "kai", "request", "x", {"summary": "two"}, thread=tid)
+    bus.send("alita", "kai", "request", "x", {"summary": "two"}, thread=tid, kind="comunicazione")
 
     assert [e["summary"] for e in bus.thread(tid)] == ["one", "two"]
 

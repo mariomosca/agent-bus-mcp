@@ -117,14 +117,14 @@ def test_where_a_message_goes(machines):
 def test_unknown_host_is_a_clear_error(machines):
     laptop, _ = machines
     with pytest.raises(BusError, match="unknown host 'marte'"):
-        laptop.send("alita", "kai@marte", "request", "x", {"summary": "s"})
+        laptop.send("alita", "kai@marte", "request", "x", {"summary": "s"}, kind="comunicazione")
 
 
 # ---------- laptop → mini ----------
 
 def test_laptop_writes_straight_into_the_mini_inbox(machines):
     laptop, mini = machines
-    res = laptop.send("alita", "kai@mini/crewmoor", "brief", "x", {"summary": "ciao"})
+    res = laptop.send("alita", "kai@mini/crewmoor", "brief", "x", {"summary": "ciao"}, kind="comunicazione")
     assert res["delivered_to"] == "kai@mini/crewmoor" and res["queued"] is False
     f = mini.session_dir("kai", "crewmoor") / f"{res['id']}.json"
     rec = json.loads(f.read_text())
@@ -137,7 +137,7 @@ def test_laptop_writes_straight_into_the_mini_inbox(machines):
 def test_mini_down_queues_and_does_not_fail(machines, net):
     laptop, mini = machines
     net.mini_down()
-    res = laptop.send("alita", "kai@mini", "request", "x", {"summary": "mentre dormi"})
+    res = laptop.send("alita", "kai@mini", "request", "x", {"summary": "mentre dormi"}, kind="comunicazione")
     assert res["queued"] is True and "unreachable" in res["warning"]
     assert (laptop.home / "outbox" / "mini" / "kai" / f"{res['id']}.json").is_file()
     assert _pending(mini.home / "inboxes") == []
@@ -170,8 +170,8 @@ def test_mini_to_mini_stays_local(machines):
 def test_collect_with_mini_down_loses_nothing(machines, net):
     laptop, mini = machines
     net.mini_down()
-    laptop.send("alita", "kai@mini", "request", "x", {"summary": "q"})
-    mini.send("kai", "alita", "request", "x", {"summary": "m"})
+    laptop.send("alita", "kai@mini", "request", "x", {"summary": "q"}, kind="comunicazione")
+    mini.send("kai", "alita", "request", "x", {"summary": "m"}, kind="comunicazione")
     [res] = laptop.collect(force=True)
     assert res["status"] == "unreachable" and res["queued"] == 1
     assert len(_pending(laptop.home / "outbox" / "mini")) == 1
@@ -181,9 +181,9 @@ def test_collect_with_mini_down_loses_nothing(machines, net):
 def test_collect_pushes_the_queue_and_pulls_the_outbox(machines, net):
     laptop, mini = machines
     net.mini_down()
-    q = laptop.send("alita", "kai@mini/crewmoor", "request", "x", {"summary": "q"})
+    q = laptop.send("alita", "kai@mini/crewmoor", "request", "x", {"summary": "q"}, kind="comunicazione")
     net.mini_up()
-    m = mini.send("kai", "alita", "request", "x", {"summary": "m"}, priority="urgent")
+    m = mini.send("kai", "alita", "request", "x", {"summary": "m"}, priority="urgent", kind="comunicazione")
     s = mini.send("kai", "kai@laptop/agent-team-os", "event", "x", {"summary": "s"})
 
     [res] = laptop.collect(force=True)
@@ -198,7 +198,7 @@ def test_collect_pushes_the_queue_and_pulls_the_outbox(machines, net):
 
 def test_pull_is_idempotent_and_keeps_what_it_cannot_read(machines):
     laptop, mini = machines
-    m = mini.send("kai", "alita", "request", "x", {"summary": "m"})
+    m = mini.send("kai", "alita", "request", "x", {"summary": "m"}, kind="comunicazione")
     laptop.collect(force=True)
     # The remote delete failed last time: the same file is back on the mini.
     out = mini.home / "outbox" / "laptop" / "alita"
@@ -214,7 +214,7 @@ def test_pull_is_idempotent_and_keeps_what_it_cannot_read(machines):
 
 def test_archived_message_is_not_reborn(machines):
     laptop, mini = machines
-    m = mini.send("kai", "alita", "request", "x", {"summary": "m"})
+    m = mini.send("kai", "alita", "request", "x", {"summary": "m"}, kind="comunicazione")
     laptop.collect(force=True)
     laptop.archive_message("alita", m["id"])
     out = mini.home / "outbox" / "laptop" / "alita"
@@ -240,7 +240,7 @@ def test_the_mini_never_tries_to_reach_the_laptop(machines, net):
 
 def test_bash_and_python_share_the_collector_lock(machines):
     laptop, mini = machines
-    mini.send("kai", "alita", "request", "x", {"summary": "m"})
+    mini.send("kai", "alita", "request", "x", {"summary": "m"}, kind="comunicazione")
     (laptop.home / "locks" / "collect-mini.lock").mkdir(parents=True)
     assert laptop.collect(force=True) == []  # someone else is collecting
     assert laptop.list_inbox("alita") == []
@@ -271,7 +271,7 @@ def test_reply_address_on_one_machine_is_unchanged(machines):
 def test_status_lists_the_mini_sessions(machines, net):
     laptop, mini = machines
     mini.register_session("kai", "/x/Projects/crewmoor")
-    laptop.send("alita", "kai@mini/crewmoor", "request", "x", {"summary": "s"})
+    laptop.send("alita", "kai@mini/crewmoor", "request", "x", {"summary": "s"}, kind="comunicazione")
     laptop.send("alita", "kai@mini", "event", "x", {"summary": "b"})
     [s] = laptop.remote_sessions("mini")
     assert (s["name"], s["slug"], s["host"], s["pending"]) == ("kai", "crewmoor", "mini", 2)
@@ -314,9 +314,9 @@ def test_single_machine_bus_is_unchanged(tmp_path, net):
     (home / "inboxes" / "kai").mkdir(parents=True)
     (home / "AGENT_MAP.json").write_text(json.dumps({"agents": {"alita": {}, "kai": {}}}))
     bus = Bus(home=home)
-    res = bus.send("alita", "kai", "request", "x", {"summary": "s"})
+    res = bus.send("alita", "kai", "request", "x", {"summary": "s"}, kind="comunicazione")
     assert "context" not in json.loads(Path(res["path"]).read_text())
     assert "host" not in bus.register_session("kai", "/x/solo")
     with pytest.raises(BusError, match="unknown host"):
-        bus.send("alita", "kai@mini", "request", "x", {"summary": "s"})
+        bus.send("alita", "kai@mini", "request", "x", {"summary": "s"}, kind="comunicazione")
     assert bus.collect(force=True) == [] and net.calls() == 0
