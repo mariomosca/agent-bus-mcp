@@ -124,6 +124,8 @@ def _summarize(path: Path, data: dict, own_slug: str, bus: Bus) -> dict:
         "ts": data.get("ts"),
         "summary": (data.get("payload") or {}).get("summary", ""),
         "task_id": data.get("task_id"),
+        "kind": data.get("kind"),
+        "task_link": data.get("task_link"),
         "scope": scope,
         "for_this_session": scope in ("all-sessions", own_slug),
     }
@@ -247,7 +249,14 @@ def bus_read(
     agent, slug = _whoami(bus)
     data = bus.read_message(agent, message_id)
     data["_reply_to"] = bus.reply_address(data)
-    if data.get("task_id") and data.get("type") == "question":
+    link = data.get("task_link") or {}
+    if link.get("by") == "da_agganciare":
+        data["_task_hint"] = (
+            f"Da agganciare: {data.get('from')} ha piu' deleghe aperte da te "
+            f"({', '.join(link.get('candidates') or [])}) e questo messaggio non dice a quale "
+            "appartiene. Decidi tu a quale task va."
+        )
+    elif data.get("task_id") and data.get("type") == "question":
         data["_task_hint"] = (
             f"Question on task {data['task_id']} that you delegated: {data['_reply_to']} is "
             f"waiting for you. Answer with bus_send(to='{data['_reply_to']}', "
