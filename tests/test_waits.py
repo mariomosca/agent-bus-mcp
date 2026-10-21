@@ -249,3 +249,100 @@ def test_delega_needs_the_sender_session(bus: Bus):
     with pytest.raises(BusError, match="sender's session"):
         bus.send(sender="alita", to="kai", msg_type="request", intent="x", payload={"summary": "s"},
                  kind="delega")
+
+
+# ---------- BS21-F2.2, F2.3: explicit consumption with bus_gestisci ----------
+
+def _delegation(bus: Bus) -> tuple[dict, dict]:
+    d = bus.send(sender="alita", to="kai/f3", msg_type="request", intent="spike",
+                 payload={"summary": "fai"}, sender_session="work-hub", kind="delega")
+    r = bus.send(sender="kai", to="alita/work-hub", msg_type="response", intent="esito",
+                 payload={"summary": "a meta'"}, sender_session="f3", in_reply_to=d["id"])
+    return d, r
+
+
+def _wait(bus: Bus, tid: str) -> dict:
+    return json.loads((bus.home / "waits" / "alita" / "@work-hub" / f"{tid}.json").read_text())
+
+
+def test_chiuso_closes_the_wait_and_files_the_message(bus: Bus):
+    d, r = _delegation(bus)
+    out = bus.handle("alita", "work-hub", r["id"], "chiuso")
+    assert out["wait"] == {"task_id": d["task_id"], "state": "closed"}
+    assert bus.count_inbox("alita", "work-hub") == 0
+    filed = json.loads(Path(out["archived_to"]).read_text())
+    assert Path(out["archived_to"]).parent.name == ".done"
+    assert filed["handled"]["esito"] == "chiuso" and filed["handled"]["by"] == "alita/work-hub"
+    w = _wait(bus, d["task_id"])
+    assert w["closed_by"] == r["id"] and w["returns"][r["id"]]["state"] == "handled"
+
+
+def test_riarma_keeps_waiting_and_sends_nothing(bus: Bus):
+    d, r = _delegation(bus)
+    before = len(list((bus.home / "inboxes" / "kai").rglob("msg-*.json")))
+    out = bus.handle("alita", "work-hub", r["id"], "riarma")
+    assert out["wait"]["state"] == "expected" and "sent" not in out
+    assert len(list((bus.home / "inboxes" / "kai").rglob("msg-*.json"))) == before
+    assert "rearmed_at" in _wait(bus, d["task_id"])
+
+
+def test_riarma_reopens_a_closed_wait(bus: Bus):
+    d, r = _delegation(bus)
+    bus.handle("alita", "work-hub", r["id"], "chiuso")
+    r2 = bus.send(sender="kai", to="alita/work-hub", msg_type="event", intent="ancora",
+                  payload={"summary": "un'altra cosa"}, sender_session="f3", task_id=d["task_id"])
+    out = bus.handle("alita", "work-hub", r2["id"], "riarma")
+    assert out["wait"]["state"] == "expected"
+    assert _wait(bus, d["task_id"])["reopened_from"] == "closed"
+
+
+def test_risposto_answers_with_the_task_id_and_keeps_the_wait(bus: Bus):
+    d, _ = _delegation(bus)
+    q = bus.send(sender="kai", to="alita/work-hub", msg_type="question", intent="domanda",
+                 payload={"summary": "tema scuro?"}, sender_session="f3", task_id=d["task_id"])
+    out = bus.handle("alita", "work-hub", q["id"], "risposto", reply="sì, scuro")
+    assert out["wait"]["state"] == "expected"
+    ans = json.loads(next((bus.home / "inboxes" / "kai" / "@f3").glob(f"{out['sent']['id']}.json")).read_text())
+    assert ans["type"] == "response" and ans["task_id"] == d["task_id"] and ans["in_reply_to"] == q["id"]
+    assert ans["payload"]["summary"] == "sì, scuro"
+    with pytest.raises(BusError, match="needs the answer text"):
+        bus.handle("alita", "work-hub", _delegation(bus)[1]["id"], "risposto")
+
+
+def test_letto_files_to_read_and_leaves_the_wait(bus: Bus):
+    d, r = _delegation(bus)
+    out = bus.handle("alita", "work-hub", r["id"], "letto")
+    assert Path(out["archived_to"]).parent.name == ".read"
+    assert _wait(bus, d["task_id"])["state"] == "expected"
+
+
+def test_handle_refuses_what_it_cannot_do(bus: Bus):
+    m = bus.send(sender="kai", to="alita/work-hub", msg_type="event", intent="x", payload={"summary": "s"})
+    with pytest.raises(BusError, match="riarma needs a return"):
+        bus.handle("alita", "work-hub", m["id"], "riarma")
+    with pytest.raises(BusError, match="esito must be"):
+        bus.handle("alita", "work-hub", m["id"], "boh")
+    bus.handle("alita", "work-hub", m["id"], "chiuso")  # a plain message: just filed as handled
+    with pytest.raises(BusError, match="already filed"):
+        bus.handle("alita", "work-hub", m["id"], "letto")
+
+
+def test_da_agganciare_is_decided_by_the_receiver(bus: Bus):
+    d1, _ = _delegation(bus)
+    d2 = bus.send(sender="alita", to="kai/f3", msg_type="brief", intent="altro",
+                  payload={"summary": "altro"}, sender_session="work-hub", kind="delega")
+    m = bus.send(sender="kai", to="alita/work-hub", msg_type="event", intent="x", payload={"summary": "?"},
+                 sender_session="f3")
+    p = Path(m["path"])
+    rec = json.loads(p.read_text())
+    rec["task_link"] = {"by": "da_agganciare", "candidates": [d1["task_id"], d2["task_id"]]}
+    p.write_text(json.dumps(rec))
+    with pytest.raises(BusError, match="say which task"):
+        bus.handle("alita", "work-hub", m["id"], "chiuso")
+    with pytest.raises(BusError, match="not a delegation of alita"):
+        bus.handle("alita", "work-hub", m["id"], "chiuso", task_id="t-20261021-altrui")
+    out = bus.handle("alita", "work-hub", m["id"], "chiuso", task_id=d2["task_id"])
+    assert out["wait"] == {"task_id": d2["task_id"], "state": "closed"}
+    filed = json.loads(Path(out["archived_to"]).read_text())
+    assert filed["task_id"] == d2["task_id"] and filed["task_link"]["by"] == "scelto"
+    assert _wait(bus, d1["task_id"])["state"] == "expected"

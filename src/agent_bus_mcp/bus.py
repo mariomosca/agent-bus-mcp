@@ -863,6 +863,105 @@ class Bus:
         tid = (data or {}).get("task_id") or ((data or {}).get("payload") or {}).get("task_id")
         return tid if isinstance(tid, str) else None
 
+    # ---------- explicit consumption (BS21-F2.2, F2.3) ----------
+    #
+    # A message leaves the inbox only with an outcome. On a return of a delegation
+    # this session made, the outcome also moves the wait:
+    #   chiuso    the task is done: wait closed, later returns wake nobody
+    #   riarma    not done yet: wait (back) to expected, nothing sent to anyone
+    #   risposto  answer sent with the same task_id (wakes the executor if idle),
+    #             wait stays open
+    #   letto     only read: archived to .read, wait untouched
+    # The wake script (agent-team-os-wake.py) reads the same fields.
+
+    ESITI = ("chiuso", "riarma", "risposto", "letto")
+    OPEN_WAIT_STATES = ("expected",)
+
+    def own_wait(self, agent: str, task_id: str | None) -> tuple[Path, dict] | None:
+        """The wait for task_id if this agent registered it (any of its sessions)."""
+        if not task_id:
+            return None
+        p = self.find_wait(task_id)
+        if p is None or p.parent.parent.name != agent:
+            return None
+        rec = _read_json(p)
+        return (p, rec) if rec else None
+
+    def handle(self, agent: str, slug: str, message_id: str, esito: str,
+               task_id: str | None = None, reply: str | None = None) -> dict:
+        if esito not in self.ESITI:
+            raise BusError(f"esito must be one of {', '.join(self.ESITI)}, not {esito!r}")
+        path = self.resolve_message(agent, message_id)
+        if path is None:
+            raise BusError(f"no message matching '{message_id}' in {agent}'s inbox")
+        if path.parent.name in (".read", ".done"):
+            raise BusError(f"{path.stem} is already filed ({path.parent.name[1:]}): nothing to handle")
+        data = _read_json(path)
+        if data is None:
+            raise BusError(f"{path.name} is not readable JSON")
+        mid = data.get("id") or path.stem
+
+        link = data.get("task_link") or {}
+        if task_id:
+            if not TASK_ID_RE.match(task_id):
+                raise BusError(f"invalid task_id {task_id!r}")
+            have = data.get("task_id")
+            if have and have != task_id:
+                raise BusError(f"{mid} already belongs to task {have}, not {task_id}")
+            if self.own_wait(agent, task_id) is None:
+                raise BusError(f"task {task_id} is not a delegation of {agent}: nothing to hook it to")
+            if not have:
+                data["task_id"] = task_id
+                data["task_link"] = {**link, "by": "scelto", "at": iso_now()}
+        elif link.get("by") == "da_agganciare" and esito in ("chiuso", "riarma"):
+            raise BusError(f"{mid} is da agganciare ({', '.join(link.get('candidates') or [])}): "
+                           "say which task with task_id")
+        tid = data.get("task_id")
+        own = self.own_wait(agent, tid)
+        if esito == "riarma" and own is None:
+            raise BusError("riarma needs a return on a delegation of yours: this message has none")
+        if esito == "risposto" and not (reply or "").strip():
+            raise BusError("risposto needs the answer text in reply")
+
+        out: dict = {"message": mid, "esito": esito, "task_id": tid}
+        if esito == "risposto":
+            sent = self.send(
+                sender=agent, to=self.reply_address(data), msg_type="response",
+                intent=f"re-{data.get('intent') or 'risposta'}", payload={"summary": reply.strip()},
+                thread=data.get("thread_id"), in_reply_to=mid, sender_session=slug, task_id=tid,
+            )
+            out["sent"] = {"id": sent["id"], "to": sent["delivered_to"], "queued": sent.get("queued")}
+
+        now = iso_now()
+        data["handled"] = {"esito": esito, "at": now, "by": f"{agent}/{slug}"}
+        dest_dir = path.parent / (".read" if esito == "letto" else ".done")
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest = dest_dir / path.name
+        self._atomic_write(dest, data)
+        path.unlink(missing_ok=True)
+        out["archived_to"] = str(dest)
+        self.clear_waiting_agent(agent, slug, answer=data)
+
+        if own is not None:
+            wpath, rec = own
+            e = (rec.setdefault("returns", {})).setdefault(mid, {
+                "from": data.get("from_session") or data.get("from"), "at": data.get("ts") or now,
+                "type": data.get("type"), "state": "pending"})
+            e.update(state="handled", handled=esito, handled_at=now)
+            e.pop("pending_wake", None)
+            if esito == "chiuso":
+                rec.update(state="closed", closed_at=now, closed_by=mid)
+            elif esito in ("riarma", "risposto"):
+                if rec.get("state") not in self.OPEN_WAIT_STATES:
+                    rec["reopened_from"] = rec.get("state")
+                rec["state"] = "expected"
+                rec["last_activity"] = now
+                if esito == "riarma":
+                    rec["rearmed_at"] = now
+            self._atomic_write(wpath, rec)
+            out["wait"] = {"task_id": rec["task_id"], "state": rec["state"]}
+        return out
+
     # ---------- waiting on another agent (v2.7) ----------
     #
     # A session that asks a question inside a delegation (type question + task_id)
