@@ -1,13 +1,8 @@
-"""Client sottile del centralino del bus (BR24-F3.3).
+"""Client sottile del centralino del bus.
 
-Quando il centralino è la fonte (``$AB_HOME/centralino.json`` con ``"fonte": "sqlite"``,
-scritto dallo script di passaggio) ogni tool diventa una chiamata al centralino sul socket
-locale (``$AB_HOME/centralino.sock``): il MCP non risolve indirizzi, non legge e non scrive
-file del bus, e restituisce la risposta del centralino così com'è. ``AB_CENTRALINO=1`` o
-``=0`` nell'ambiente forza l'uno o l'altro percorso (prova su una sola sessione).
-
-Se il centralino non risponde la tool fallisce con un errore chiaro: nessun ripiego
-silenzioso sui file, che farebbe divergere SQLite dai file proprio durante la modalità ombra.
+Ogni tool è una chiamata al centralino sul socket locale (``$AB_HOME/centralino.sock``): il MCP
+non risolve indirizzi, non legge e non scrive file del bus, e restituisce la risposta del
+centralino così com'è. Se il centralino non risponde la tool fallisce con un errore chiaro.
 
 Il processo MCP vive quanto la sessione Claude, quindi un battito ogni 60 s dice al
 centralino che la sessione è viva anche durante un turno lungo e fuori da Onda.
@@ -25,17 +20,6 @@ from typing import Any, Callable
 
 HEARTBEAT_S = 60
 TIMEOUT_S = 60
-
-
-def attivo() -> bool:
-    env = os.environ.get("AB_CENTRALINO", "").strip()
-    if env in ("0", "1"):
-        return env == "1"
-    try:
-        modo = json.loads((socket_path().parent / "centralino.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return False
-    return isinstance(modo, dict) and modo.get("fonte") == "sqlite"
 
 
 def socket_path() -> Path:
@@ -102,8 +86,7 @@ def chiama(op: str, args: dict, cwd: str) -> Any:
     except (OSError, ValueError) as exc:
         raise ErroreCentralino(
             f"il centralino del bus non risponde su {path} ({exc}). Il bus non e' utilizzabile da "
-            "questa sessione finche' il centralino non riparte: avvisa Mario o Alita. Per tornare al "
-            "percorso a file si toglie AB_CENTRALINO dalla configurazione del MCP.", "giu") from None
+            "questa sessione finche' il centralino non riparte: avvisa Mario o Alita.", "giu") from None
     if not resp.get("ok"):
         err = resp.get("error") or {}
         raise ErroreCentralino(err.get("message") or "errore del centralino", err.get("code") or "internal")

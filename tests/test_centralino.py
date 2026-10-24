@@ -1,4 +1,4 @@
-"""BR24-F3.3: con AB_CENTRALINO=1 le tool sono un client sottile del centralino."""
+"""BR24-F5.5: le tool sono un client sottile del centralino, non c'è altro percorso."""
 
 from __future__ import annotations
 
@@ -11,7 +11,8 @@ from pathlib import Path
 import pytest
 
 from agent_bus_mcp import server
-from agent_bus_mcp.bus import BusError
+from agent_bus_mcp import centralino
+from agent_bus_mcp.server import _SERVER_DIR, BusError, _caller_cwd
 
 
 class FintoCentralino:
@@ -52,7 +53,6 @@ def finto(monkeypatch, tmp_path):
     home = Path(tempfile.mkdtemp(prefix="cm-", dir="/tmp"))  # path corto per il socket
     ws = tmp_path / "Projects" / "orbit"
     ws.mkdir(parents=True)
-    monkeypatch.setenv("AB_CENTRALINO", "1")
     monkeypatch.setenv("AB_HOME", str(home))
     monkeypatch.setenv("AB_CWD", str(ws))
     monkeypatch.setenv("ONDA_TERMINAL_ID", "pane-1")
@@ -105,28 +105,10 @@ def test_centralino_giu_errore_chiaro(finto):
         server.bus_inbox()
 
 
-def test_senza_interruttore_codice_di_oggi(finto, monkeypatch):
-    monkeypatch.delenv("AB_CENTRALINO")
-    with pytest.raises(BusError):  # cwd non mappato nel bus vero di prova: il percorso a file
-        server.bus_inbox()
-    assert finto.richieste == []
-
-
 def test_chiusura_per_task_id(finto):
     server.bus_gestisci(esito="chiuso", task_id="t-20261024-abcdef")
     req = finto.richieste[-1]
     assert req["op"] == "handle" and req["args"] == {"esito": "chiuso", "task_id": "t-20261024-abcdef"}
-
-
-def test_acceso_da_centralino_json(monkeypatch, tmp_path):
-    from agent_bus_mcp import centralino
-    monkeypatch.setenv("AB_HOME", str(tmp_path))
-    monkeypatch.delenv("AB_CENTRALINO", raising=False)
-    assert centralino.attivo() is False
-    (tmp_path / "centralino.json").write_text('{"fonte": "sqlite", "sveglia": "attiva"}')
-    assert centralino.attivo() is True
-    monkeypatch.setenv("AB_CENTRALINO", "0")
-    assert centralino.attivo() is False  # override per una sessione
 
 
 def test_v3_reply_close_read_thread(finto):
@@ -139,34 +121,69 @@ def test_v3_reply_close_read_thread(finto):
     assert finto.richieste[-1]["op"] == "thread"
 
 
-def test_v3_a_file_delega_completa(monkeypatch, tmp_path):
-    """bus_reply e bus_close funzionano anche senza centralino (prima del passaggio)."""
-    monkeypatch.setenv("AB_CENTRALINO", "0")
-    monkeypatch.setenv("AB_HOME", str(tmp_path))
-    monkeypatch.setenv("AB_WAKE_SCRIPT", "/nonexistent")
-    for a in ("kai", "alita"):
-        (tmp_path / "inboxes" / a).mkdir(parents=True)
-    (tmp_path / "AGENT_MAP.json").write_text(json.dumps({
-        "rules": [{"pattern": str(tmp_path / "ws" / "kai"), "agent": "kai"},
-                  {"pattern": str(tmp_path / "ws" / "alita"), "agent": "alita"}],
-        "agents": {"kai": {}, "alita": {}}}))
-    for a in ("kai", "alita"):
-        (tmp_path / "ws" / a / "s1").mkdir(parents=True)
-    for v in ("AB_AGENT", "AB_SESSION_SLUG"):
-        monkeypatch.delenv(v, raising=False)
-    come = lambda a: monkeypatch.setenv("AB_CWD", str(tmp_path / "ws" / a / "s1"))  # noqa: E731
-    come("alita")
-    d = server.bus_send(to="kai/s1", intent="x", summary="fai", message_type="request", kind="delega")
-    come("kai")
-    q = server.bus_reply(message_id=d["id"], summary="A o B?", message_type="question")
-    assert q["sent"]["to"] == "alita/s1" and q["task_id"] == d["task_id"]
-    come("alita")
-    qid = server.bus_inbox()["messages"][0]["id"]
-    r = server.bus_reply(message_id=qid, summary="B")
-    assert r["wait"]["state"] == "expected" and r["remaining"] == 0
-    come("kai")
-    e = server.bus_reply(message_id=r["sent"]["id"], summary="fatto")
-    come("alita")
-    c = server.bus_close(message_id=e["sent"]["id"])
-    assert c["wait"]["state"] == "closed" and c["remaining"] == 0
-    assert server.bus_read(thread_id=server.bus_read(message_id=e["sent"]["id"])["thread_id"])["count"] >= 3
+def test_tutte_le_tool_e_gli_alias_sono_registrati():
+    import asyncio
+    tools = asyncio.run(server.mcp.list_tools())
+    assert {t.name for t in tools} == {
+        "bus_send", "bus_reply", "bus_close", "bus_inbox", "bus_read", "bus_status",  # v3
+        "bus_gestisci", "bus_archive", "bus_waits", "bus_expect", "bus_thread"}      # alias fino al 31/10/2026
+
+
+def test_status_senza_cwd_risponde_comunque(finto, monkeypatch):
+    """Lanciato nella sua stessa cartella il server non sa chi chiama: il centralino risponde con me.error."""
+    monkeypatch.delenv("AB_CWD")
+    monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+    monkeypatch.chdir(_SERVER_DIR)
+    assert server.bus_status(agent="kai") == {"op": "status"}
+    assert finto.richieste[-1]["caller"]["cwd"] == "" and finto.richieste[-1]["args"] == {"agent": "kai"}
+
+
+def test_gli_argomenti_none_non_partono(finto):
+    server.bus_inbox()
+    assert finto.richieste[-1]["args"] == {"all_sessions": False, "unread_only": False}
+    server.bus_close(message_id="msg-1")
+    assert finto.richieste[-1]["args"] == {"message_id": "msg-1", "esito": "chiuso"}
+
+
+def test_heartbeat_un_battito_subito(finto, monkeypatch):
+    import time
+    monkeypatch.setattr(centralino, "HEARTBEAT_S", 3600)
+    centralino.avvia_heartbeat(lambda: "/tmp")
+    for _ in range(50):
+        if finto.richieste:
+            break
+        time.sleep(0.05)
+    assert finto.richieste[0]["op"] == "session.heartbeat" and finto.richieste[0]["caller"]["cwd"] == "/tmp"
+
+
+def test_errore_interno_del_centralino(finto):
+    finto.risposta = lambda req: {"v": 1, "id": req["id"], "ok": False, "error": {"code": "not_found", "message": "no message"}}
+    with pytest.raises(BusError, match="no message"):
+        server.bus_read(message_id="msg-9")
+    with pytest.raises(centralino.ErroreCentralino) as e:
+        centralino.chiama("read", {}, "/tmp")
+    assert e.value.code == "not_found"
+
+
+# ---------- chi chiama: la cartella della sessione, non quella del server ----------
+
+def test_segnaposto_non_espanso_si_ignora(monkeypatch, tmp_path):
+    monkeypatch.setenv("AB_CWD", "${CLAUDE_PROJECT_DIR:-${PWD}}")
+    monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+    monkeypatch.chdir(tmp_path)
+    assert _caller_cwd() == str(tmp_path)
+
+
+def test_percorso_vero_nell_ambiente_vince_sulla_cwd(monkeypatch, tmp_path):
+    real = tmp_path / "workspace"
+    real.mkdir()
+    monkeypatch.setenv("AB_CWD", str(real))
+    assert _caller_cwd() == str(real)
+
+
+def test_la_cartella_del_server_e_rifiutata(monkeypatch):
+    monkeypatch.delenv("AB_CWD", raising=False)
+    monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+    monkeypatch.chdir(_SERVER_DIR)
+    with pytest.raises(BusError, match="own directory"):
+        _caller_cwd()
