@@ -21,6 +21,7 @@ from typing import Annotated, Any
 from fastmcp import FastMCP
 from pydantic import Field
 
+from . import centralino
 from .bus import Bus, BusError, parse_addr, slug_for_path
 
 mcp = FastMCP(
@@ -60,6 +61,14 @@ mcp = FastMCP(
 
 def _bus() -> Bus:
     return Bus()
+
+
+def _via_centralino(op: str, cwd: str | None = None, **args: Any) -> Any:
+    """BR24-F3.3: con AB_CENTRALINO=1 la tool e' solo una chiamata al centralino."""
+    try:
+        return centralino.chiama(op, args, cwd if cwd is not None else _caller_cwd())
+    except centralino.ErroreCentralino as exc:
+        raise BusError(str(exc)) from None
 
 
 def _whoami(bus: Bus) -> tuple[str, str]:
@@ -146,6 +155,12 @@ def bus_status(
     message reaches the workspace that is actually doing that work. Sessions on
     another host (read over SSH, cached 20 s) carry their `agent@host/slug` address.
     """
+    if centralino.attivo():
+        try:
+            cwd = _caller_cwd()
+        except BusError:
+            cwd = ""  # il centralino risponde comunque, con me.error
+        return _via_centralino("status", cwd, agent=agent)
     bus = _bus()
     host = bus.host_self()
     try:
@@ -230,6 +245,8 @@ def bus_inbox(
     On the machine that reaches the others over SSH, first collects what they
     left for us (at most every 30 s).
     """
+    if centralino.attivo():
+        return _via_centralino("inbox", all_sessions=all_sessions, unread_only=unread_only)
     bus = _bus()
     agent, slug = _whoami(bus)
     bus.collect()
@@ -250,6 +267,8 @@ def bus_read(
     archive: Annotated[bool, Field(description="Move to .read/ after reading.")] = False,
 ) -> dict:
     """Read one message in full, including its payload and context refs."""
+    if centralino.attivo():
+        return _via_centralino("read", message_id=message_id, archive=archive)
     bus = _bus()
     agent, slug = _whoami(bus)
     data = bus.read_message(agent, message_id)
@@ -322,6 +341,12 @@ def bus_send(
     task_id ('attesa registrata t-...'): whatever the recipient sends back on it
     wakes you when you are idle. kind='comunicazione' wakes nobody.
     """
+    if centralino.attivo():
+        return _via_centralino(
+            "send", to=to, intent=intent, summary=summary, message_type=message_type, kind=kind,
+            priority=priority, details=details, context_refs=context_refs,
+            requires_response=requires_response, thread_id=thread_id, in_reply_to=in_reply_to,
+            response_by=response_by, task_id=task_id, expect_result=expect_result)
     bus = _bus()
     sender, sender_slug = _whoami(bus)
     if expect_result:
@@ -383,6 +408,9 @@ def bus_expect(
     When a message with this task_id reaches this session and the session is
     idle, the bus wakes it once. A task_id has a single waiter bus-wide.
     """
+    if centralino.attivo():
+        return _via_centralino("expect", description=description, delegated_to=delegated_to,
+                               deadline=deadline, task_id=task_id)
     bus = _bus()
     agent, slug = _whoami(bus)
     rec = bus.expect(agent, slug, description, delegated_to=delegated_to, deadline=deadline,
@@ -410,6 +438,8 @@ def bus_waits(
     why a wake is postponed), the questions on them still waiting for your answer
     (`waiting_on_you`) and the other returns not yet handled with bus_gestisci
     (`unhandled_returns`)."""
+    if centralino.attivo():
+        return _via_centralino("waits", include_closed=include_closed, all_sessions=all_sessions)
     bus = _bus()
     agent, slug = _whoami(bus)
     rows = bus.list_waits(agent, None if all_sessions else slug, include_closed)
@@ -454,6 +484,8 @@ def bus_gestisci(
     (any session of yours: e.g. one left open by an earlier session, or whose
     returns were already filed); its returns still in the inbox are filed too.
     """
+    if centralino.attivo():
+        return _via_centralino("handle", message_id=message_id, esito=esito, reply=reply, task_id=task_id)
     bus = _bus()
     agent, slug = _whoami(bus)
     if not message_id:
@@ -479,6 +511,8 @@ def bus_archive(
 
     'done' and 'read' only move the file: a wait stays open.
     """
+    if centralino.attivo():
+        return _via_centralino("archive", message_id=message_id, state=state)
     bus = _bus()
     agent, _ = _whoami(bus)
     dest = bus.archive_message(agent, message_id, state)
@@ -491,11 +525,15 @@ def bus_thread(
     thread_id: Annotated[str, Field(description="Thread id, e.g. 'thread-20260921-noicalendar'.")],
 ) -> dict:
     """Replay a conversation in order: who said what, when."""
+    if centralino.attivo():
+        return _via_centralino("thread", "", thread_id=thread_id)
     entries = _bus().thread(thread_id)
     return {"thread_id": thread_id, "count": len(entries), "entries": entries}
 
 
 def main() -> None:
+    if centralino.attivo():
+        centralino.avvia_heartbeat(_caller_cwd)
     mcp.run()
 
 
