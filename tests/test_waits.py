@@ -346,3 +346,108 @@ def test_da_agganciare_is_decided_by_the_receiver(bus: Bus):
     filed = json.loads(Path(out["archived_to"]).read_text())
     assert filed["task_id"] == d2["task_id"] and filed["task_link"]["by"] == "scelto"
     assert _wait(bus, d1["task_id"])["state"] == "expected"
+
+
+# ---------- BR24 passo 0: casi del 24 ottobre ----------
+
+def _register(bus: Bus, agent: str, slug: str, age_min: float = 0) -> None:
+    d = bus.home / "registry" / f"{agent}.d"
+    d.mkdir(parents=True, exist_ok=True)
+    seen = (datetime.now(timezone.utc) - timedelta(minutes=age_min)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    (d / f"{slug}.json").write_text(json.dumps({"name": agent, "slug": slug, "last_seen": seen}))
+
+
+def test_br24_close_wait_by_task_id_with_returns_already_filed(bus: Bus):
+    # caso iv: ritorni gia' archiviati, bus_gestisci rifiutava ("already filed")
+    d, r = _delegation(bus)
+    bus.archive_message("alita", r["id"], "done")
+    with pytest.raises(BusError, match="already filed"):
+        bus.handle("alita", "work-hub", r["id"], "chiuso")
+    out = bus.close_wait("alita", "work-hub", d["task_id"], note="lavoro concluso")
+    assert (out["state"], out["was"], out["filed"]) == ("closed", "expected", [])
+    w = _wait(bus, d["task_id"])
+    assert w["state"] == "closed" and w["note"] == "lavoro concluso" and w["closed_by"] == "close:alita/work-hub"
+
+
+def test_br24_close_wait_files_pending_returns_and_works_from_another_session(bus: Bus):
+    # t-20261021-xn9lv0: una delega di una sessione precedente, chiusa dalla sessione di oggi
+    d, r = _delegation(bus)
+    out = bus.close_wait("alita", "nuova", d["task_id"])
+    assert out["state"] == "closed" and [f["id"] for f in out["filed"]] == [r["id"]]
+    assert bus.count_inbox("alita", "work-hub") == 0
+    assert _wait(bus, d["task_id"])["returns"][r["id"]]["handled"] == "chiuso"
+    with pytest.raises(BusError, match="not a delegation of kai"):
+        bus.close_wait("kai", "f3", d["task_id"])
+
+
+def test_br24_server_gestisci_without_message_id_closes(bus: Bus, monkeypatch):
+    from agent_bus_mcp import server
+    d, _ = _delegation(bus)
+    monkeypatch.setenv("AB_AGENT", "alita")
+    monkeypatch.setenv("AB_SESSION_SLUG", "work-hub")
+    monkeypatch.setenv("AB_CWD", str(bus.home))
+    monkeypatch.setattr(server, "_bus", lambda: bus)
+    fn = getattr(server.bus_gestisci, "fn", server.bus_gestisci)
+    with pytest.raises(BusError, match="without message_id"):
+        fn(esito="letto", task_id=d["task_id"])
+    out = fn(esito="chiuso", task_id=d["task_id"])
+    assert out["state"] == "closed" and out["remaining"] == 0
+
+
+def test_br24_wait_belongs_to_its_session_while_it_lives(bus: Bus):
+    # caso iii: bus_read diceva a kai/orbit "hai delegato" per l'attesa di kai/agent-team-os
+    d, r = _delegation(bus)
+    _register(bus, "alita", "work-hub")
+    assert bus.own_wait("alita", d["task_id"], "work-hub") is not None
+    assert bus.own_wait("alita", d["task_id"], "altra") is None
+    m = bus.send(sender="kai", to="alita", msg_type="event", intent="x", payload={"summary": "s"},
+                 sender_session="f3", task_id=d["task_id"])
+    with pytest.raises(BusError, match="riarma needs a return"):
+        bus.handle("alita", "altra", m["id"], "riarma")
+    # la sessione che ha delegato non c'e' piu': l'attesa passa a chi c'e'
+    _register(bus, "alita", "work-hub", age_min=300)
+    assert bus.own_wait("alita", d["task_id"], "altra") is not None
+    assert bus.handle("alita", "altra", r["id"], "chiuso")["wait"]["state"] == "closed"
+
+
+def test_br24_handle_keeps_what_the_wake_round_wrote(bus: Bus):
+    # F2.4: l'attesa si rilegge dentro il lock, non si riscrive la copia letta prima
+    d, r = _delegation(bus)
+    f = bus.home / "waits" / "alita" / "@work-hub" / f"{d['task_id']}.json"
+    real = bus.own_wait
+
+    def stale(agent, task_id, slug=None):
+        got = real(agent, task_id, slug)
+        if got is not None:  # il giro della sveglia scrive dopo la lettura
+            rec = json.loads(f.read_text())
+            rec["executor_session"] = "kai/f3"
+            rec.setdefault("returns", {})["m-x"] = {"state": "pending", "pending_wake": {"reason": "tetto_task"}}
+            f.write_text(json.dumps(rec))
+        return got
+    bus.own_wait = stale
+    bus.handle("alita", "work-hub", r["id"], "chiuso")
+    w = _wait(bus, d["task_id"])
+    assert w["state"] == "closed" and w["executor_session"] == "kai/f3" and "m-x" in w["returns"]
+    assert "pending_wake" not in w  # F2.7: un'attesa chiusa non ha rimandi
+
+
+def test_br24_onda_session_counts_as_live(bus: Bus):
+    # caso ii: "no live session 'kai/orbit'" con la sessione al lavoro in Onda
+    import os
+    _register(bus, "kai", "onda-electron")
+    (bus.home / "onda").mkdir()
+    doc = {"v": 1, "ondaPid": os.getpid(), "writtenAt": datetime.now(timezone.utc).isoformat(),
+           "sessions": [{"agent": "kai", "slug": "orbit", "state": "working", "cwd": "/p/Orbit"},
+                        {"agent": "kai", "slug": "vecchia", "state": "exited"}]}
+    (bus.home / "onda" / "sessions.json").write_text(json.dumps(doc))
+    assert {s["slug"] for s in bus.list_sessions("kai")} == {"onda-electron", "orbit"}
+    out = bus.send(sender="alita", to="kai/orbit", msg_type="brief", intent="x", payload={"summary": "s"},
+                   sender_session="work-hub", kind="comunicazione")
+    assert not out.get("warning")
+    out = bus.send(sender="alita", to="kai/vecchia", msg_type="brief", intent="x", payload={"summary": "s"},
+                   sender_session="work-hub", kind="comunicazione")
+    assert "no live session 'kai/vecchia'" in out["warning"]
+    # Onda spento: solo il registro
+    doc["ondaPid"] = 999999
+    (bus.home / "onda" / "sessions.json").write_text(json.dumps(doc))
+    assert {s["slug"] for s in bus.list_sessions("kai")} == {"onda-electron"}
