@@ -25,6 +25,7 @@ mini's outbox/laptop/ that the laptop pulls. Same semantics as the bash lib.
 
 from __future__ import annotations
 
+import fcntl
 import io
 import json
 import os
@@ -140,6 +141,36 @@ def _read_json(path: Path) -> dict | None:
         return data if isinstance(data, dict) else None
     except (OSError, json.JSONDecodeError):
         return None
+
+
+class WaitsLock:
+    """BR24-F2.4: the wait files have three writers (this server, the wake script's
+    round and its gestisci): each one re-reads and writes inside the same flock on
+    locks/waits.flock (same name in agent-team-os-wake.py)."""
+
+    def __init__(self, home: Path) -> None:
+        self.path = home / "locks" / "waits.flock"
+
+    def __enter__(self) -> "WaitsLock":
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.fh = self.path.open("a")
+        fcntl.flock(self.fh, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc) -> None:
+        fcntl.flock(self.fh, fcntl.LOCK_UN)
+        self.fh.close()
+
+
+def _with_pending_wake(rec: dict) -> dict:
+    """The reason of the last postponed wake still open, on an open wait only."""
+    why = [e["pending_wake"] for e in (rec.get("returns") or {}).values()
+           if e.get("state") == "pending" and e.get("pending_wake")]
+    if why and rec.get("state") == "expected":
+        rec["pending_wake"] = max(why, key=lambda w: w.get("checked_at") or "")
+    else:
+        rec.pop("pending_wake", None)
+    return rec
 
 
 class BusError(RuntimeError):
@@ -484,8 +515,29 @@ class Bus:
     def registry_dir(self, agent: str) -> Path:
         return self.home / "registry" / f"{agent}.d"
 
+    def onda_sessions(self, agent: str) -> list[dict]:
+        """Sessions of an agent that Onda shows live on this machine (onda/sessions.json).
+        Empty when Onda is not running or has not written the file for a minute."""
+        doc = _read_json(self.home / "onda" / "sessions.json") or {}
+        try:
+            os.kill(int(doc.get("ondaPid")), 0)
+            written = datetime.fromisoformat(str(doc.get("writtenAt")).replace("Z", "+00:00"))
+        except (OSError, ValueError, TypeError):
+            return []
+        if datetime.now(timezone.utc) - written > timedelta(seconds=60):
+            return []
+        me = self.host_self()
+        return [s for s in doc.get("sessions") or [] if isinstance(s, dict) and s.get("agent") == agent
+                and s.get("slug") and s.get("state") != "exited"
+                and not (s.get("host") and me and s["host"] != me)]
+
+    def session_live(self, agent: str, slug: str) -> bool:
+        return any(s["slug"] == slug for s in self.list_sessions(agent))
+
     def list_sessions(self, agent: str, include_stale: bool = False) -> list[dict]:
-        """Live sessions for an agent, most recently seen first."""
+        """Live sessions for an agent, most recently seen first: the registry plus the
+        sessions Onda shows live (BR24-F2.2: a session resumed after a SessionEnd is
+        missing from the registry until its next prompt, but Onda has it)."""
         out: list[dict] = []
         now = datetime.now(timezone.utc)
         for entry in sorted(self.registry_dir(agent).glob("*.json")):
@@ -499,11 +551,21 @@ class Bus:
                 stale = (now - ts) > timedelta(minutes=SESSION_TTL_MIN)
             except ValueError:
                 pass
-            if stale and not include_stale:
-                continue
             data["stale"] = stale
             data["pending"] = self.count_inbox(agent, data["slug"])
             out.append(data)
+        onda = {s["slug"]: s for s in self.onda_sessions(agent)}
+        for d in out:
+            if d["slug"] in onda and d["stale"]:
+                d["stale"] = False
+                d["last_seen"] = iso_now()
+        out = [d for d in out if include_stale or not d["stale"]]
+        known = {d["slug"] for d in out}
+        for slug, s in onda.items():
+            if slug not in known:
+                out.append({"name": agent, "slug": slug, "active": True, "last_seen": iso_now(),
+                            "workspace_path": s.get("cwd"), "source": "onda", "stale": False,
+                            "pending": self.count_inbox(agent, slug)})
         out.sort(key=lambda d: d.get("last_seen") or "", reverse=True)
         return out
 
@@ -802,9 +864,6 @@ class Bus:
                 datetime.fromisoformat(deadline.replace("Z", "+00:00"))
             except ValueError:
                 raise BusError(f"deadline is not ISO 8601: {deadline!r}") from None
-        if (existing := self.find_wait(task_id)) is not None:
-            raise BusError(f"task {task_id} already has a waiter "
-                           f"({existing.parent.parent.name}/{existing.parent.name[1:]}): one task, one waiter")
         rec = {
             "v": 1,
             "task_id": task_id,
@@ -822,7 +881,11 @@ class Bus:
             # BS21: the delegation message and its thread, for hooking returns that
             # come back as new messages (agent-team-os-wake.py).
             rec["delegation"] = {k: v for k, v in delegation.items() if v}
-        self._atomic_write(self.wait_dir(agent, slug) / f"{task_id}.json", rec)
+        with WaitsLock(self.home):
+            if (existing := self.find_wait(task_id)) is not None:
+                raise BusError(f"task {task_id} already has a waiter "
+                               f"({existing.parent.parent.name}/{existing.parent.name[1:]}): one task, one waiter")
+            self._atomic_write(self.wait_dir(agent, slug) / f"{task_id}.json", rec)
         return rec
 
     def list_waits(self, agent: str, slug: str | None = None, include_closed: bool = False) -> list[dict]:
@@ -877,12 +940,17 @@ class Bus:
     ESITI = ("chiuso", "riarma", "risposto", "letto")
     OPEN_WAIT_STATES = ("expected",)
 
-    def own_wait(self, agent: str, task_id: str | None) -> tuple[Path, dict] | None:
-        """The wait for task_id if this agent registered it (any of its sessions)."""
+    def own_wait(self, agent: str, task_id: str | None, slug: str | None = None) -> tuple[Path, dict] | None:
+        """The wait for task_id if this session registered it (BR24-F2.6: per session,
+        not per agent). Another session of the same agent gets it only when the one
+        that delegated is no longer live: the wait passes to whoever is there. Without
+        slug, any session of the agent (explicit close by task_id)."""
         if not task_id:
             return None
         p = self.find_wait(task_id)
         if p is None or p.parent.parent.name != agent:
+            return None
+        if slug and p.parent.name != f"@{slug}" and self.session_live(agent, p.parent.name[1:]):
             return None
         rec = _read_json(p)
         return (p, rec) if rec else None
@@ -908,8 +976,8 @@ class Bus:
             have = data.get("task_id")
             if have and have != task_id:
                 raise BusError(f"{mid} already belongs to task {have}, not {task_id}")
-            if self.own_wait(agent, task_id) is None:
-                raise BusError(f"task {task_id} is not a delegation of {agent}: nothing to hook it to")
+            if self.own_wait(agent, task_id, slug) is None:
+                raise BusError(f"task {task_id} is not a delegation of {agent}/{slug}: nothing to hook it to")
             if not have:
                 data["task_id"] = task_id
                 data["task_link"] = {**link, "by": "scelto", "at": iso_now()}
@@ -917,7 +985,7 @@ class Bus:
             raise BusError(f"{mid} is da agganciare ({', '.join(link.get('candidates') or [])}): "
                            "say which task with task_id")
         tid = data.get("task_id")
-        own = self.own_wait(agent, tid)
+        own = self.own_wait(agent, tid, slug)
         if esito == "riarma" and own is None:
             raise BusError("riarma needs a return on a delegation of yours: this message has none")
         if esito == "risposto" and not (reply or "").strip():
@@ -943,24 +1011,66 @@ class Bus:
         self.clear_waiting_agent(agent, slug, answer=data)
 
         if own is not None:
-            wpath, rec = own
-            e = (rec.setdefault("returns", {})).setdefault(mid, {
-                "from": data.get("from_session") or data.get("from"), "at": data.get("ts") or now,
-                "type": data.get("type"), "state": "pending"})
-            e.update(state="handled", handled=esito, handled_at=now)
-            e.pop("pending_wake", None)
-            if esito == "chiuso":
-                rec.update(state="closed", closed_at=now, closed_by=mid)
-            elif esito in ("riarma", "risposto"):
-                if rec.get("state") not in self.OPEN_WAIT_STATES:
-                    rec["reopened_from"] = rec.get("state")
-                rec["state"] = "expected"
-                rec["last_activity"] = now
-                if esito == "riarma":
-                    rec["rearmed_at"] = now
-            self._atomic_write(wpath, rec)
+            wpath = own[0]
+            with WaitsLock(self.home):  # re-read inside the lock: the wake round may have just written it
+                rec = _read_json(wpath) or own[1]
+                e = (rec.setdefault("returns", {})).setdefault(mid, {
+                    "from": data.get("from_session") or data.get("from"), "at": data.get("ts") or now,
+                    "type": data.get("type"), "state": "pending"})
+                e.update(state="handled", handled=esito, handled_at=now)
+                e.pop("pending_wake", None)
+                if esito == "chiuso":
+                    rec.update(state="closed", closed_at=now, closed_by=mid)
+                elif esito in ("riarma", "risposto"):
+                    if rec.get("state") not in self.OPEN_WAIT_STATES:
+                        rec["reopened_from"] = rec.get("state")
+                    rec["state"] = "expected"
+                    rec["last_activity"] = now
+                    if esito == "riarma":
+                        rec["rearmed_at"] = now
+                self._atomic_write(wpath, _with_pending_wake(rec))
             out["wait"] = {"task_id": rec["task_id"], "state": rec["state"]}
         return out
+
+    def close_wait(self, agent: str, slug: str, task_id: str, note: str | None = None) -> dict:
+        """BR24-F2.3: close the wait of a task of this agent without a message to
+        handle (its returns already filed, or a delegation of an earlier session).
+        Returns of the task still in the inbox are filed in .done with esito chiuso
+        and listed in the result. Same as agent-team-os-wake.py chiudi."""
+        if not TASK_ID_RE.match(task_id or ""):
+            raise BusError(f"invalid task_id {task_id!r}")
+        own = self.own_wait(agent, task_id)
+        if own is None:
+            raise BusError(f"task {task_id} is not a delegation of {agent}: no wait to close")
+        wpath = own[0]
+        now = iso_now()
+        filed: list[dict] = []
+        base = self.inbox_root(agent)
+        for d in (base / f"@{slug}", base / wpath.parent.name, base):
+            for p in sorted(d.glob("msg-*.json")) if d.is_dir() else []:
+                m = _read_json(p)
+                if not m or (m.get("task_id") or (m.get("payload") or {}).get("task_id")) != task_id \
+                        or m.get("kind") == "delega":
+                    continue
+                m["handled"] = {"esito": "chiuso", "at": now, "by": f"{agent}/{slug}", "via": "close"}
+                self._atomic_write(p.parent / ".done" / p.name, m)
+                p.unlink(missing_ok=True)
+                filed.append({"id": m.get("id") or p.stem, "type": m.get("type"),
+                              "summary": str((m.get("payload") or {}).get("summary") or "")[:200]})
+        with WaitsLock(self.home):
+            rec = _read_json(wpath) or own[1]
+            prev = rec.get("state")
+            for f in filed:
+                e = (rec.setdefault("returns", {})).setdefault(f["id"], {"type": f["type"], "at": now})
+                e.update(state="handled", handled="chiuso", handled_at=now)
+                e.pop("pending_wake", None)
+            if prev in self.OPEN_WAIT_STATES or prev == "expired":
+                rec.update(state="closed", closed_at=now, closed_by=f"close:{agent}/{slug}")
+                if note:
+                    rec["note"] = note
+            self._atomic_write(wpath, _with_pending_wake(rec))
+        self.clear_waiting_agent(agent, slug, task_id=task_id)
+        return {"task_id": task_id, "state": rec["state"], "was": prev, "filed": filed}
 
     # ---------- waiting on another agent (v2.7) ----------
     #
