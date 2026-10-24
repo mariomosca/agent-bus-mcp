@@ -116,3 +116,57 @@ def test_chiusura_per_task_id(finto):
     server.bus_gestisci(esito="chiuso", task_id="t-20261024-abcdef")
     req = finto.richieste[-1]
     assert req["op"] == "handle" and req["args"] == {"esito": "chiuso", "task_id": "t-20261024-abcdef"}
+
+
+def test_acceso_da_centralino_json(monkeypatch, tmp_path):
+    from agent_bus_mcp import centralino
+    monkeypatch.setenv("AB_HOME", str(tmp_path))
+    monkeypatch.delenv("AB_CENTRALINO", raising=False)
+    assert centralino.attivo() is False
+    (tmp_path / "centralino.json").write_text('{"fonte": "sqlite", "sveglia": "attiva"}')
+    assert centralino.attivo() is True
+    monkeypatch.setenv("AB_CENTRALINO", "0")
+    assert centralino.attivo() is False  # override per una sessione
+
+
+def test_v3_reply_close_read_thread(finto):
+    server.bus_reply(message_id="msg-1", summary="fatto")
+    assert finto.richieste[-1]["op"] == "reply"
+    assert finto.richieste[-1]["args"] == {"message_id": "msg-1", "summary": "fatto", "message_type": "response"}
+    server.bus_close(task_id="t-20261024-abcdef")
+    assert finto.richieste[-1]["args"] == {"task_id": "t-20261024-abcdef", "esito": "chiuso"}
+    server.bus_read(thread_id="thread-1")
+    assert finto.richieste[-1]["op"] == "thread"
+
+
+def test_v3_a_file_delega_completa(monkeypatch, tmp_path):
+    """bus_reply e bus_close funzionano anche senza centralino (prima del passaggio)."""
+    monkeypatch.setenv("AB_CENTRALINO", "0")
+    monkeypatch.setenv("AB_HOME", str(tmp_path))
+    monkeypatch.setenv("AB_WAKE_SCRIPT", "/nonexistent")
+    for a in ("kai", "alita"):
+        (tmp_path / "inboxes" / a).mkdir(parents=True)
+    (tmp_path / "AGENT_MAP.json").write_text(json.dumps({
+        "rules": [{"pattern": str(tmp_path / "ws" / "kai"), "agent": "kai"},
+                  {"pattern": str(tmp_path / "ws" / "alita"), "agent": "alita"}],
+        "agents": {"kai": {}, "alita": {}}}))
+    for a in ("kai", "alita"):
+        (tmp_path / "ws" / a / "s1").mkdir(parents=True)
+    for v in ("AB_AGENT", "AB_SESSION_SLUG"):
+        monkeypatch.delenv(v, raising=False)
+    come = lambda a: monkeypatch.setenv("AB_CWD", str(tmp_path / "ws" / a / "s1"))  # noqa: E731
+    come("alita")
+    d = server.bus_send(to="kai/s1", intent="x", summary="fai", message_type="request", kind="delega")
+    come("kai")
+    q = server.bus_reply(message_id=d["id"], summary="A o B?", message_type="question")
+    assert q["sent"]["to"] == "alita/s1" and q["task_id"] == d["task_id"]
+    come("alita")
+    qid = server.bus_inbox()["messages"][0]["id"]
+    r = server.bus_reply(message_id=qid, summary="B")
+    assert r["wait"]["state"] == "expected" and r["remaining"] == 0
+    come("kai")
+    e = server.bus_reply(message_id=r["sent"]["id"], summary="fatto")
+    come("alita")
+    c = server.bus_close(message_id=e["sent"]["id"])
+    assert c["wait"]["state"] == "closed" and c["remaining"] == 0
+    assert server.bus_read(thread_id=server.bus_read(message_id=e["sent"]["id"])["thread_id"])["count"] >= 3

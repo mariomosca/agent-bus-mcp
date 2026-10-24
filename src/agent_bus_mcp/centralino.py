@@ -1,9 +1,10 @@
 """Client sottile del centralino del bus (BR24-F3.3).
 
-Con ``AB_CENTRALINO=1`` nell'ambiente del server MCP, ogni tool diventa una chiamata al
-centralino sul socket locale (``$AB_HOME/centralino.sock``): il MCP non risolve indirizzi,
-non legge e non scrive file del bus, e restituisce la risposta del centralino così com'è.
-Senza la variabile gira il codice di oggi: togliere la variabile è il rollback.
+Quando il centralino è la fonte (``$AB_HOME/centralino.json`` con ``"fonte": "sqlite"``,
+scritto dallo script di passaggio) ogni tool diventa una chiamata al centralino sul socket
+locale (``$AB_HOME/centralino.sock``): il MCP non risolve indirizzi, non legge e non scrive
+file del bus, e restituisce la risposta del centralino così com'è. ``AB_CENTRALINO=1`` o
+``=0`` nell'ambiente forza l'uno o l'altro percorso (prova su una sola sessione).
 
 Se il centralino non risponde la tool fallisce con un errore chiaro: nessun ripiego
 silenzioso sui file, che farebbe divergere SQLite dai file proprio durante la modalità ombra.
@@ -27,7 +28,14 @@ TIMEOUT_S = 60
 
 
 def attivo() -> bool:
-    return os.environ.get("AB_CENTRALINO", "").strip() == "1"
+    env = os.environ.get("AB_CENTRALINO", "").strip()
+    if env in ("0", "1"):
+        return env == "1"
+    try:
+        modo = json.loads((socket_path().parent / "centralino.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(modo, dict) and modo.get("fonte") == "sqlite"
 
 
 def socket_path() -> Path:
@@ -48,7 +56,7 @@ def caller(cwd: str) -> dict:
         "cwd": cwd,
         "agent": os.environ.get("AB_AGENT") or None,
         "slug": os.environ.get("AB_SESSION_SLUG") or None,
-        "pid": os.getppid(),
+        # niente pid: il padre di questo processo è uv, non la sessione (il pid lo danno gli hook)
         "claude_session_id": os.environ.get("CLAUDE_CODE_SESSION_ID"),
         "onda_terminal_id": os.environ.get("ONDA_TERMINAL_ID"),
         "tmux_pane": os.environ.get("TMUX_PANE"),
