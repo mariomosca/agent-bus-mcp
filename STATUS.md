@@ -4,6 +4,9 @@
 **Owner**: Alita. **Nato da**: bug sessioni parallele Kai, 21 set 2026.
 
 ## Fatto
+- Rimozione del bus a file (BR24-F5.5, ramo `feat/br24-f55-rimozione`): via `bus.py` e ogni ramo a
+  file di `server.py`, `centralino.py` senza `attivo()` (sempre acceso). Sei tool v3 e cinque alias
+  fino al 31/10/2026, battito di 60 s. 21 test. `src/` da 1.767 a 391 righe.
 - v2.8 deleghe dichiarate (21 ott 2026, piano BS21, ramo `feat/bs21-deleghe`): `kind` obbligatorio
   (delega | comunicazione) su request/brief/handoff, la delega registra l'attesa da sola,
   `bus_gestisci` (chiuso, riarma, risposto, letto), `bus_inbox`/`bus_read` mostrano kind e aggancio,

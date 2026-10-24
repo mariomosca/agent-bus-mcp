@@ -8,6 +8,18 @@ Nato il 21 set 2026 dal bug delle sessioni parallele: due Kai aperti insieme
 unico destinatario. Il fix (bus v1.4, `agent/slug`) vive nella lib bash; questo server lo
 espone come API di prima classe.
 
+## Bus v3 (BR24-F5.5)
+
+Il server è solo un client sottile: ogni tool è una chiamata al **centralino** (daemon di
+`agent-team-os/centralino`, socket `$AB_HOME/centralino.sock`), che tiene tutto lo stato in SQLite.
+Qui non c'è più il layer a file (`bus.py` è stato tolto): niente interruttore `AB_CENTRALINO`,
+niente `centralino.json`. Con il centralino giù le tool falliscono con un errore chiaro, senza ripiego.
+Le tool sono sei (`bus_send`, `bus_reply`, `bus_close`, `bus_inbox`, `bus_read`, `bus_status`);
+`bus_gestisci`, `bus_archive`, `bus_waits`, `bus_expect` e `bus_thread` restano come alias fino
+al 31 ottobre 2026. Un battito ogni 60 s dice al centralino che la sessione è viva. Le sezioni
+qui sotto (file di casella, `.read/`, `.done/`, lock) descrivono il bus a file e valgono solo
+per il mini, finché non passa anche lui al centralino.
+
 ## Tool
 
 | Tool | A cosa serve |
@@ -93,17 +105,13 @@ claude mcp add agent-bus -- uv run --directory ~/Projects/07-Tooling/mcp/agent-b
 ## Test
 
 ```bash
-uv run --with pytest --with fastmcp --with pydantic pytest tests/ -q
+uv run --with pytest pytest -q
 ```
 
-45 test. Quelli che contano davvero:
-`test_targeted_message_reaches_only_its_session`,
-`test_two_sessions_do_not_overwrite_each_other`,
-`test_archive_keeps_message_in_its_own_session_dir`, e per le due macchine
-(`tests/test_hosts.py`, con un `ssh` finto nel `PATH` che esegue in locale su un secondo
-`AB_HOME`): `test_mini_down_queues_and_does_not_fail`,
-`test_collect_pushes_the_queue_and_pulls_the_outbox`,
-`test_pull_is_idempotent_and_keeps_what_it_cannot_read`.
+21 test (`tests/test_centralino.py`): un finto centralino su un socket Unix registra le richieste e
+verifica la mappa tool -> operazione (v3 e alias), gli argomenti, i rifiuti, il centralino giù, il
+battito, e come si decide la cartella del chiamante. La logica del bus ha i suoi test in
+`agent-team-os/centralino/tests` e nel banco di prova `centralino sim`.
 
 ## Relazione con il resto
 
