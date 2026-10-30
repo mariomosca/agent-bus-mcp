@@ -36,7 +36,8 @@ mcp = FastMCP(
         "session, else to the shared box. Call bus_status when unsure.\n\n"
         "Every request, brief and handoff declares kind: 'delega' (you want the outcome back: "
         "the bus registers the wait and wakes you on every return) or 'comunicazione' (nothing "
-        "comes back, wakes nobody); without it bus_send refuses. Executing a delegation: "
+        "comes back, wakes nobody); without it bus_send refuses. A request is always a "
+        "delega: 'comunicazione' is for a brief or a handoff. Executing a delegation: "
         "questions with bus_reply(message_id=<the delegation>, message_type='question'), the "
         "outcome with bus_reply(message_id=<the delegation>) when done. Delegating: answer a "
         "question with bus_reply, consume a return with bus_close: chiuso (done, the wait "
@@ -138,7 +139,7 @@ def bus_send(
     intent: Annotated[str, Field(description="Short intent, e.g. 'bug-fix', 'new-app', 'review-request'.")],
     summary: Annotated[str, Field(description="What the recipient needs to know, in plain prose.")],
     message_type: Annotated[str, Field(description="request | brief | response | question | event | handoff")] = "request",
-    kind: Annotated[str | None, Field(description="Mandatory for request, brief and handoff, no default: 'delega' = you want the outcome back (the bus registers the wait, returns its task_id and wakes you on every return), 'comunicazione' = nothing has to come back. Leave it out for response, question and event.")] = None,
+    kind: Annotated[str | None, Field(description="Mandatory for request, brief and handoff, no default: 'delega' = you want the outcome back (the bus registers the wait, returns its task_id and wakes you on every return), 'comunicazione' = nothing has to come back (brief and handoff only: a request is always 'delega'). Leave it out for response, question and event.")] = None,
     priority: Annotated[str, Field(description="low | normal | high | urgent")] = "normal",
     details: Annotated[dict | None, Field(description="Extra payload fields beyond the summary.")] = None,
     context_refs: Annotated[list[str] | None, Field(description="Absolute paths the recipient should read.")] = None,
@@ -160,7 +161,8 @@ def bus_send(
     A request, brief or handoff says what it is with `kind`, or the send is
     refused. kind='delega' registers the wait on this session and returns its
     task_id ('attesa registrata t-...'): whatever the recipient sends back on it
-    wakes you when you are idle. kind='comunicazione' wakes nobody.
+    wakes you when you are idle. kind='comunicazione' wakes nobody and is for a
+    brief or a handoff: a request is always a delega.
     """
     return _via_centralino(
         "send", to=to, intent=intent, summary=summary, message_type=message_type, kind=kind,
